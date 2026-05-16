@@ -1,73 +1,63 @@
 #!/usr/bin/env python3
-"""
-=============================================================================
- NoIR Biomedical Optical Sensing System
- Raspberry Pi NoIR Camera — Infrared Tissue Reflection Analysis Platform
-=============================================================================
+# =============================================================================
+#  NoIR Biomedical Optical Sensing System  —  v2
+#  Raspberry Pi NoIR Camera | 850 nm IR Reflectance Imaging Platform
+# =============================================================================
+#
+#  Author        : Biomedical Optics Research Prototype
+#  Target HW     : Raspberry Pi 4/5 + NoIR Camera Module v2/v3
+#  Illumination  : 850 nm IR LEDs  +  White LEDs  (GPIO-controlled)
+#  Enclosure     : Black optical-isolation chamber
+#  Python        : 3.9+
+#  Dependencies  : numpy, opencv-python-headless, scipy, picamera2, RPi.GPIO
+#
+#  SCIENTIFIC DISCLAIMER
+#  ─────────────────────
+#  This system observes *reflected near-infrared light* (850 nm) from the
+#  surface and shallow subsurface of biological tissue (penetration ≈ 1–3 mm).
+#  It is NOT capable of deep-tissue imaging, X-ray, MRI, or clinical diagnosis.
+#  All signals and outputs are explicitly labelled "experimental / non-clinical".
+#
+#  OPTICAL PHYSICS BACKGROUND
+#  ──────────────────────────
+#  At 850 nm, dominant tissue chromophores are oxy/deoxy-haemoglobin, water,
+#  and melanin.  The NoIR camera captures backscattered flux encoding local
+#  optical properties (µa, µs') within that shallow volume — the physical
+#  basis of near-infrared diffuse reflectance and reflectance-mode rPPG.
+#  A Butterworth bandpass (0.7–4 Hz) isolates the experimental pulsatile
+#  component of the raw ROI-averaged intensity signal.
+#
+#  PIPELINE OVERVIEW
+#  ─────────────────
+#  [Picamera2 CSI]
+#      │
+#      ▼
+#  [Adaptive Exposure Controller]  ← ROI brightness feedback loop
+#      │
+#      ▼
+#  [IR Channel Extraction + Noise Filtering]
+#      │
+#      ▼
+#  [Adaptive Tissue Segmenter]     ← contour/ellipse fingertip detection
+#      │
+#      ▼
+#  [Motion & Quality Gate]         ← MAD + Laplacian + saturation check
+#      │
+#      ▼
+#  [Optical Signal Extractor]      ← temporal buffer → Butterworth BP
+#      │
+#      ▼
+#  [Quality Engine]                ← EXCELLENT / GOOD / FAIR / POOR / INVALID
+#      │
+#      ▼
+#  [AI Interpreter]                ← rule-based non-clinical optical feedback
+#      │
+#      ▼
+#  [Terminal Dashboard  +  OpenCV Research Visualiser]
+#
+# =============================================================================
 
- Author        : Biomedical Optics Research Prototype
- Target HW     : Raspberry Pi 4/5 + NoIR Camera Module v2/v3
- Illumination  : 850 nm IR LEDs + White LED (optional)
- Enclosure     : Black optical isolation chamber
- Python        : 3.9+
- License       : Research / Experimental Use Only
-
- SCIENTIFIC DISCLAIMER
- ---------------------
- This system observes *reflected near-infrared light* (850 nm) from the
- surface and shallow subsurface of biological tissue.  It is NOT capable
- of:  X-ray imaging, MRI, deep-tissue scanning, or clinical diagnosis.
- All outputs are labelled "experimental" and must NOT be used for any
- medical or clinical decision.
-
- OPTICAL PHYSICS BACKGROUND
- --------------------------
- At 850 nm the dominant tissue chromophores are oxy- and deoxy-haemoglobin,
- water, and melanin.  Skin optical penetration depth for CW 850 nm light
- is typically 1–3 mm (depending on tissue type and pigmentation).  The
- NoIR camera detects the backscattered/reflected flux, which encodes
- information about local optical properties (µa, µs') within that shallow
- volume.  This is the physical basis of near-infrared diffuse reflectance
- spectroscopy and reflectance-mode photoplethysmography (rPPG).
-
- HARDWARE SETUP
- --------------
- 1. Attach NoIR Camera to CSI ribbon connector.
- 2. Mount 2–4 × 850 nm IR LEDs symmetrically around the lens (≈15 mm
-    stand-off from tissue surface).  Drive at ≈50 mA (verify datasheet).
- 3. (Optional) Add one white LED for reference/visible-light mode.
- 4. Enclose in a black-anodised aluminium or black-painted ABS chamber to
-    reject ambient light (critical for SNR).
- 5. Aperture for fingertip placement ≈ 15 × 30 mm.
-
- PIPELINE OVERVIEW
- -----------------
-   [Picamera2 CSI stream]
-       │
-       ▼
-   [Frame pre-processing]   ← grayscale, IR extraction, exposure norm.
-       │
-       ▼
-   [Quality gate]           ← motion score, sharpness, saturation check
-       │
-       ▼
-   [ROI detection / lock]   ← fingertip localisation within frame
-       │
-       ▼
-   [Optical analysis]       ← intensity, variance, stability, PPG proxy
-       │
-       ▼
-   [AI interpretation]      ← rule-based optical quality feedback
-       │
-       ▼
-   [Terminal dashboard  +  OpenCV overlay visualisation]
-
-=============================================================================
-"""
-
-# ---------------------------------------------------------------------------
-# Standard library
-# ---------------------------------------------------------------------------
+# ─── Standard library ────────────────────────────────────────────────────────
 import sys
 import os
 import time
@@ -77,267 +67,396 @@ import queue
 import signal
 import logging
 import collections
+import traceback
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Deque
+from enum import Enum, auto
+from typing import Optional, Tuple, List, Deque, Dict
 
-# ---------------------------------------------------------------------------
-# Third-party (must be installed on the Pi):
-#   pip install numpy opencv-python-headless picamera2
-# ---------------------------------------------------------------------------
+# ─── Third-party ─────────────────────────────────────────────────────────────
 import numpy as np
 
 try:
     import cv2
-    CV2_AVAILABLE = True
+    CV2_OK = True
 except ImportError:
-    CV2_AVAILABLE = False
-    print("[WARN] opencv-python not found.  Visualisation disabled.")
+    CV2_OK = False
 
 try:
-    from picamera2 import Picamera2 # sudo apt install python3-picamera2 
-    from libcamera import controls as libcam_controls # pip install opencv-python-headless
-    PICAMERA2_AVAILABLE = True
+    from scipy.signal import butter, sosfilt, sosfilt_zi
+    SCIPY_OK = True
 except ImportError:
-    PICAMERA2_AVAILABLE = False
-    print("[WARN] picamera2 not found.  Running in DEMO/SIMULATION mode.")
+    SCIPY_OK = False
 
-# ---------------------------------------------------------------------------
-# Logging — structured, engineering-style
-# ---------------------------------------------------------------------------
+try:
+    from picamera2 import Picamera2
+    from libcamera import controls as lc
+    PICAM_OK = True
+except ImportError:
+    PICAM_OK = False
+
+try:
+    import RPi.GPIO as GPIO
+    GPIO_OK = True
+except ImportError:
+    GPIO_OK = False
+
+# ─── Logger ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("NoIR-BioSensor")
+log = logging.getLogger("NoIR-v2")
 
 
-# ===========================================================================
-# § 1  CONFIGURATION
-# ===========================================================================
+# =============================================================================
+# §1  ENUMERATIONS
+# =============================================================================
 
-@dataclass
-class CameraConfig:
-    """Picamera2 acquisition parameters optimised for 850 nm IR reflectance."""
+class IlluminationMode(Enum):
+    IR_ONLY    = auto()   # 850 nm IR LEDs only
+    WHITE_ONLY = auto()   # White LEDs only
+    HYBRID     = auto()   # Both simultaneously (reference comparison)
+    OFF        = auto()   # Dark-frame baseline
 
-    # Frame dimensions — VGA is a good trade-off between resolution and CPU
-    width: int = 640
-    height: int = 480
 
-    # Target frame rate (fps).  30 is achievable at VGA on Pi 4.
-    target_fps: int = 30
+class OpticalQuality(Enum):
+    EXCELLENT = "EXCELLENT"
+    GOOD      = "GOOD"
+    FAIR      = "FAIR"
+    POOR      = "POOR"
+    INVALID   = "INVALID"
 
-    # Exposure time bounds (µs).  IR isolation chamber → longer exposures OK.
-    min_exposure_us: int = 5_000      # 5 ms  — motion blur floor
-    max_exposure_us: int = 33_000     # 33 ms — ≈ 1 frame at 30 fps
 
-    # Analogue gain — keep low to minimise shot noise on slow signals
-    analogue_gain: float = 4.0
-
-    # Auto-white-balance off: NoIR in grayscale, AWB is irrelevant
-    awb_mode: str = "off"
-
-    # AEC/AGC — we use manual exposure for signal stability
-    auto_exposure: bool = False
-
-    # Camera format — BGR888 from Picamera2, we convert to gray immediately
-    pixel_format: str = "BGR888"
-
+# =============================================================================
+# §2  CONFIGURATION
+# =============================================================================
 
 @dataclass
-class OpticalConfig:
-    """Physical/optical parameters of the 850 nm sensing system."""
-
-    # Near-IR wavelength (nm) — informational; used in log headers
-    ir_wavelength_nm: int = 850
-
-    # Expected tissue reflectance range [0–255 grayscale].
-    # Lightly pigmented skin at 850 nm typically reflects 40–80 % of incident.
-    expected_intensity_min: int = 40
-    expected_intensity_max: int = 220
-
-    # Gaussian blur kernel (px) for speckle / shot-noise suppression
-    blur_kernel_size: int = 5
-
-    # CLAHE clip limit for adaptive histogram equalisation
-    clahe_clip_limit: float = 2.0
-    clahe_tile_grid: Tuple[int, int] = (8, 8)
-
-    # Adaptive threshold block size & constant
-    adapt_thresh_block: int = 21
-    adapt_thresh_c: int = 4
+class CamCfg:
+    width:          int   = 640
+    height:         int   = 480
+    target_fps:     int   = 30
+    pixel_format:   str   = "BGR888"
+    # Manual exposure seed values — adaptive controller will tune these
+    init_exposure_us: int  = 15_000
+    init_gain:        float = 4.0
+    # Exposure controller bounds
+    min_exposure_us:  int  = 3_000
+    max_exposure_us:  int  = 40_000
+    min_gain:         float = 1.0
+    max_gain:         float = 8.0
 
 
 @dataclass
-class ROIConfig:
-    """Region-of-interest parameters for fingertip optical sensing."""
-
-    # Fraction of frame to use as the central ROI (width, height)
-    roi_fraction_w: float = 0.45
-    roi_fraction_h: float = 0.55
-
-    # Minimum mean intensity to accept an ROI frame as "finger present"
-    presence_intensity_threshold: int = 35
-
-    # Temporal smoothing window (frames) for optical signal
-    signal_window: int = 90           # 3 s at 30 fps
-
-
-@dataclass
-class MotionConfig:
-    """Frame-difference–based motion artefact detection thresholds."""
-
-    # Mean absolute difference [0–255] above which frame is flagged as "motion"
-    motion_flag_threshold: float = 8.0
-
-    # Laplacian variance below which the frame is "blurry" (motion smear)
-    blur_threshold: float = 25.0
-
-    # Exponential moving-average alpha for motion score
-    ema_alpha: float = 0.25
-
-
-# ===========================================================================
-# § 2  DATA STRUCTURES
-# ===========================================================================
-
-@dataclass
-class FrameMetrics:
-    """All per-frame quantitative optical metrics — populated by the pipeline."""
-
-    timestamp: float = 0.0
-    frame_index: int = 0
-
-    # Whole-frame metrics
-    mean_intensity: float = 0.0
-    std_intensity: float = 0.0
-    min_intensity: float = 0.0
-    max_intensity: float = 0.0
-    saturation_fraction: float = 0.0   # fraction of pixels at 255
-
-    # Sharpness (Laplacian variance — higher = sharper)
-    laplacian_variance: float = 0.0
-
-    # Motion (frame-difference MAD)
-    motion_mad: float = 0.0
-    motion_score: float = 0.0          # 0 (still) … 1 (heavy motion)
-
-    # ROI metrics
-    roi_mean: float = 0.0
-    roi_std: float = 0.0
-    roi_variance: float = 0.0
-    finger_present: bool = False
-
-    # Derived optical scores [0–1]
-    optical_stability: float = 0.0
-    image_quality: float = 0.0
-    optical_confidence: float = 0.0
-
-    # Instantaneous FPS measured by the acquisition loop
-    fps: float = 0.0
+class OptCfg:
+    ir_wavelength_nm:      int   = 850
+    # Target mean ROI intensity for adaptive exposure [LSB]
+    target_roi_intensity:  float = 140.0
+    # Acceptable band around target before correction kicks in
+    intensity_deadband:    float = 15.0
+    # CLAHE
+    clahe_clip:            float = 2.5
+    clahe_tile:            Tuple[int,int] = (8, 8)
+    # Gaussian blur kernel (must be odd)
+    blur_k:                int   = 5
+    # Butterworth bandpass for optical pulsatility waveform
+    bp_low_hz:             float = 0.7
+    bp_high_hz:            float = 4.0
+    bp_order:              int   = 4
+    # Signal buffer length (frames)
+    signal_buf_len:        int   = 300   # 10 s @ 30 fps
+    # Minimum buffer fill before filtering
+    min_buf_for_filter:    int   = 60    # 2 s
 
 
 @dataclass
-class OpticalSignalBuffer:
+class GPIOCfg:
+    ir_led_pin:    int = 17   # BCM numbering
+    white_led_pin: int = 27
+    # PWM frequency (Hz)
+    pwm_freq:      int = 1000
+    # Default duty cycles [0–100]
+    ir_duty:       float = 80.0
+    white_duty:    float = 60.0
+
+
+@dataclass
+class SegCfg:
+    # Otsu threshold region to search within (central fraction of frame)
+    search_frac_w: float = 0.80
+    search_frac_h: float = 0.85
+    # Minimum contour area as fraction of search area
+    min_area_frac: float = 0.02
+    # Ellipse fit quality threshold
+    ellipse_ratio_min: float = 0.30   # minor/major axis ratio
+    # Fallback fixed ROI fraction when segmentation fails
+    fallback_frac_w: float = 0.45
+    fallback_frac_h: float = 0.55
+    # Smoothing alpha for ROI centre EMA
+    ema_alpha: float = 0.20
+
+
+@dataclass
+class MotCfg:
+    motion_flag_mad:   float = 8.0    # MAD threshold [LSB]
+    blur_threshold:    float = 25.0   # Laplacian variance
+    ema_alpha:         float = 0.25
+
+
+# =============================================================================
+# §3  DATA CONTAINERS
+# =============================================================================
+
+@dataclass
+class ROIState:
+    """Current best estimate of the fingertip ROI."""
+    x1: int = 0; y1: int = 0; x2: int = 0; y2: int = 0
+    cx: float = 0.0; cy: float = 0.0
+    from_segmentation: bool = False
+    confidence: float = 0.0
+    # Ellipse params (None if not fitted)
+    ellipse: Optional[Tuple] = None
+
+
+@dataclass
+class FrameData:
+    """All per-frame derived quantities — output of the full pipeline."""
+    ts:                  float = 0.0
+    frame_idx:           int   = 0
+    fps:                 float = 0.0
+    illum_mode:          IlluminationMode = IlluminationMode.IR_ONLY
+
+    # Photometry
+    mean_intensity:      float = 0.0
+    std_intensity:       float = 0.0
+    saturation_frac:     float = 0.0
+    laplacian_var:       float = 0.0
+
+    # Motion
+    motion_mad:          float = 0.0
+    motion_score:        float = 0.0   # [0=still, 1=heavy]
+    is_motion_corrupt:   bool  = False
+
+    # Exposure controller state
+    current_exposure_us: int   = 15_000
+    current_gain:        float = 4.0
+
+    # ROI
+    roi:                 ROIState = field(default_factory=ROIState)
+    finger_present:      bool = False
+    roi_mean:            float = 0.0
+    roi_std:             float = 0.0
+
+    # Optical signal (waveform)
+    raw_signal_latest:    float = 0.0
+    filtered_signal_latest: float = 0.0
+    signal_ac_rms:        float = 0.0
+    signal_snr_db:        float = 0.0
+    pulsatility_confidence: float = 0.0  # [0,1] non-clinical proxy
+
+    # Composite scores [0,1]
+    optical_stability:   float = 0.0
+    image_quality:       float = 0.0
+    optical_confidence:  float = 0.0
+    quality_class:       OpticalQuality = OpticalQuality.INVALID
+
+
+# =============================================================================
+# §4  GPIO / ILLUMINATION CONTROLLER
+# =============================================================================
+
+class IlluminationController:
     """
-    Circular buffer of per-frame ROI mean intensity values.
+    Controls 850 nm IR and white LED banks via Raspberry Pi GPIO PWM.
+    Falls back to a no-op stub when RPi.GPIO is unavailable.
 
-    This sequence is the 'optical signal' — in reflectance-mode PPG research
-    it would be bandpass-filtered to extract cardiac pulsatility.  Here we
-    expose it as a raw experimental signal without any clinical inference.
+    GPIO wiring (BCM):
+      Pin 17 → IR LED MOSFET gate   (850 nm bank)
+      Pin 27 → White LED MOSFET gate
     """
-    maxlen: int = 300   # 10 s at 30 fps
 
-    _buf: Deque[float] = field(default_factory=lambda: collections.deque(maxlen=300))
-    _timestamps: Deque[float] = field(default_factory=lambda: collections.deque(maxlen=300))
+    def __init__(self, cfg: GPIOCfg):
+        self._cfg = cfg
+        self._mode = IlluminationMode.IR_ONLY
+        self._ir_pwm = None
+        self._wh_pwm = None
+        self._hw_ok = False
+        self._init_gpio()
 
-    def push(self, value: float, t: float) -> None:
-        self._buf.append(value)
-        self._timestamps.append(t)
+    def _init_gpio(self) -> None:
+        if not GPIO_OK:
+            log.warning("RPi.GPIO unavailable — LED control disabled (simulation).")
+            return
+        try:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            GPIO.setup(self._cfg.ir_led_pin, GPIO.OUT)
+            GPIO.setup(self._cfg.white_led_pin, GPIO.OUT)
+            self._ir_pwm = GPIO.PWM(self._cfg.ir_led_pin, self._cfg.pwm_freq)
+            self._wh_pwm = GPIO.PWM(self._cfg.white_led_pin, self._cfg.pwm_freq)
+            self._ir_pwm.start(0)
+            self._wh_pwm.start(0)
+            self._hw_ok = True
+            log.info("GPIO LED controller initialised (IR pin=%d, White pin=%d).",
+                     self._cfg.ir_led_pin, self._cfg.white_led_pin)
+        except Exception as e:
+            log.warning("GPIO init failed: %s", e)
 
-    def as_array(self) -> np.ndarray:
-        return np.array(self._buf, dtype=np.float32)
+    def set_mode(self, mode: IlluminationMode) -> None:
+        self._mode = mode
+        if not self._hw_ok:
+            return
+        if mode == IlluminationMode.IR_ONLY:
+            self._ir_pwm.ChangeDutyCycle(self._cfg.ir_duty)
+            self._wh_pwm.ChangeDutyCycle(0)
+        elif mode == IlluminationMode.WHITE_ONLY:
+            self._ir_pwm.ChangeDutyCycle(0)
+            self._wh_pwm.ChangeDutyCycle(self._cfg.white_duty)
+        elif mode == IlluminationMode.HYBRID:
+            self._ir_pwm.ChangeDutyCycle(self._cfg.ir_duty)
+            self._wh_pwm.ChangeDutyCycle(self._cfg.white_duty)
+        else:  # OFF
+            self._ir_pwm.ChangeDutyCycle(0)
+            self._wh_pwm.ChangeDutyCycle(0)
 
-    def signal_ac_rms(self) -> float:
-        """AC RMS of the detrended optical signal (proxy for pulsatility)."""
-        a = self.as_array()
-        if len(a) < 10:
-            return 0.0
-        detrended = a - np.mean(a)
-        return float(np.sqrt(np.mean(detrended ** 2)))
+    @property
+    def mode(self) -> IlluminationMode:
+        return self._mode
 
-    def signal_snr_db(self) -> float:
-        """Estimated signal-to-noise ratio in dB (DC/AC ratio in log scale)."""
-        a = self.as_array()
-        if len(a) < 10:
-            return 0.0
-        dc = np.mean(a)
-        ac_rms = self.signal_ac_rms()
-        if ac_rms < 1e-6:
-            return 60.0   # effectively infinite SNR → very stable
-        return 20.0 * math.log10(dc / ac_rms + 1e-9)
-
-    def __len__(self) -> int:
-        return len(self._buf)
+    def cleanup(self) -> None:
+        if self._hw_ok:
+            self.set_mode(IlluminationMode.OFF)
+            self._ir_pwm.stop()
+            self._wh_pwm.stop()
+            GPIO.cleanup()
+            log.info("GPIO cleaned up.")
 
 
-# ===========================================================================
-# § 3  CAMERA ACQUISITION LAYER
-# ===========================================================================
+# =============================================================================
+# §5  ADAPTIVE EXPOSURE CONTROLLER
+# =============================================================================
+
+class AdaptiveExposureController:
+    """
+    Proportional–integral exposure controller that keeps the ROI mean
+    intensity near a target value by tuning Picamera2 ExposureTime and
+    AnalogueGain.
+
+    Control law (PI):
+        error  = target_intensity − roi_mean
+        if |error| > deadband:
+            correction = Kp * error + Ki * integral_error
+        Apply correction first to ExposureTime; saturate gain as secondary.
+
+    This avoids the large frame-to-frame variance that AEC introduces on
+    pulsatile optical signals — manual control is essential for rPPG / optical
+    biosignal extraction.
+    """
+
+    Kp = 0.005      # proportional gain (normalised to [0,1] error)
+    Ki = 0.0008     # integral gain
+    integral_clamp = 50.0  # anti-windup
+
+    def __init__(self, cam_cfg: CamCfg, opt_cfg: OptCfg):
+        self._cam = cam_cfg
+        self._opt = opt_cfg
+        self._exposure_us: float = cam_cfg.init_exposure_us
+        self._gain: float = cam_cfg.init_gain
+        self._integral: float = 0.0
+        self._camera: Optional[Picamera2] = None  # injected after camera init
+
+    def inject_camera(self, cam: "Picamera2") -> None:
+        self._camera = cam
+
+    def update(self, roi_mean: float) -> Tuple[int, float]:
+        """
+        Given current ROI mean intensity, compute updated exposure & gain.
+
+        Returns (exposure_us, gain) — already applied to camera if available.
+        """
+        error = self._opt.target_roi_intensity - roi_mean
+
+        if abs(error) <= self._opt.intensity_deadband:
+            # Within deadband — freeze to avoid noise-driven hunting
+            return int(self._exposure_us), self._gain
+
+        # PI update
+        self._integral = np.clip(
+            self._integral + error, -self.integral_clamp, self.integral_clamp
+        )
+        correction = self.Kp * error + self.Ki * self._integral
+
+        # Primary: adjust exposure (proportionally)
+        self._exposure_us *= (1.0 + correction)
+        self._exposure_us = float(
+            np.clip(self._exposure_us,
+                    self._cam.min_exposure_us, self._cam.max_exposure_us)
+        )
+
+        # Secondary: if exposure is saturated, adjust gain
+        if self._exposure_us >= self._cam.max_exposure_us - 100 and error > 0:
+            self._gain = min(self._gain * 1.05, self._cam.max_gain)
+        elif self._exposure_us <= self._cam.min_exposure_us + 100 and error < 0:
+            self._gain = max(self._gain * 0.95, self._cam.min_gain)
+
+        # Push to hardware
+        if self._camera is not None and PICAM_OK:
+            try:
+                self._camera.set_controls({
+                    "ExposureTime": int(self._exposure_us),
+                    "AnalogueGain": float(self._gain),
+                })
+            except Exception:
+                pass
+
+        return int(self._exposure_us), self._gain
+
+
+# =============================================================================
+# §6  CAMERA ACQUISITION
+# =============================================================================
 
 class CameraAcquisition:
     """
-    Wraps Picamera2 (or a simulation fallback) to deliver BGR frames via a
-    thread-safe queue.  The acquisition thread runs independently at the
-    requested frame rate so that downstream processing never blocks the
-    camera pipeline.
+    Picamera2 CSI pipeline with a dedicated daemon thread.
+    Falls back to a physically-realistic synthetic IR scene for dev/testing.
     """
 
-    def __init__(self, cfg: CameraConfig):
+    def __init__(self, cfg: CamCfg, exp_ctrl: AdaptiveExposureController):
         self._cfg = cfg
-        self._camera: Optional["Picamera2"] = None
-        self._frame_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=4)
+        self._exp = exp_ctrl
+        self._camera: Optional[Picamera2] = None
+        self._q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=3)
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._frame_count = 0
-        self._last_ts = time.monotonic()
         self._fps_ema = 0.0
+        self._last_t = time.monotonic()
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    # ── public ───────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Initialise camera hardware and start the acquisition thread."""
-        if PICAMERA2_AVAILABLE:
-            self._init_picamera2()
+        if PICAM_OK:
+            self._init_hw()
         else:
-            log.warning("Picamera2 unavailable — using synthetic IR test signal.")
-
+            log.warning("Picamera2 unavailable — synthetic IR simulation active.")
         self._running = True
         self._thread = threading.Thread(
-            target=self._acquisition_loop, daemon=True, name="cam-acq"
-        )
+            target=self._loop, daemon=True, name="cam-acq")
         self._thread.start()
         log.info("Camera acquisition thread started.")
 
     def stop(self) -> None:
-        """Gracefully stop acquisition and release hardware."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=3.0)
         if self._camera:
             self._camera.stop()
             self._camera.close()
-            log.info("Camera hardware released.")
 
     def get_frame(self, timeout: float = 0.5) -> Optional[np.ndarray]:
-        """
-        Retrieve the latest frame from the queue (BGR uint8 ndarray).
-        Returns None on timeout.
-        """
         try:
-            return self._frame_queue.get(timeout=timeout)
+            return self._q.get(timeout=timeout)
         except queue.Empty:
             return None
 
@@ -345,918 +464,1130 @@ class CameraAcquisition:
     def fps(self) -> float:
         return self._fps_ema
 
-    # ------------------------------------------------------------------
-    # Internal — hardware init
-    # ------------------------------------------------------------------
+    # ── private ──────────────────────────────────────────────────────────────
 
-    def _init_picamera2(self) -> None:
-        """Configure Picamera2 for fixed-exposure IR reflectance imaging."""
+    def _init_hw(self) -> None:
         self._camera = Picamera2()
-
-        # Build a still-capture–style config at video speed
-        cfg = self._camera.create_video_configuration(
-            main={
-                "size": (self._cfg.width, self._cfg.height),
-                "format": self._cfg.pixel_format,
-            },
+        cam_cfg = self._camera.create_video_configuration(
+            main={"size": (self._cfg.width, self._cfg.height),
+                  "format": self._cfg.pixel_format},
             controls={
-                # Manual exposure — essential for optical signal stability
-                "AeEnable": False,
-                "ExposureTime": self._cfg.min_exposure_us,
-                "AnalogueGain": self._cfg.analogue_gain,
-                # Disable AWB — irrelevant for grayscale IR
-                "AwbEnable": False,
-                # Colour gains 1,1 → neutral (camera still outputs BGR)
-                "ColourGains": (1.0, 1.0),
-                # No noise reduction — we do our own
-                "NoiseReductionMode": libcam_controls.draft.NoiseReductionModeEnum.Off,
+                "AeEnable":          False,
+                "AwbEnable":         False,
+                "ExposureTime":      self._cfg.init_exposure_us,
+                "AnalogueGain":      self._cfg.init_gain,
+                "ColourGains":       (1.0, 1.0),
+                "NoiseReductionMode": lc.draft.NoiseReductionModeEnum.Off,
             },
         )
-        self._camera.configure(cfg)
+        self._camera.configure(cam_cfg)
         self._camera.start()
-        # Allow auto-exposure to settle before locking (won't apply — AeEnable=False)
-        time.sleep(0.5)
-        log.info(
-            "Picamera2 configured: %dx%d @ %dfps, exposure=%dµs, gain=%.1f",
-            self._cfg.width, self._cfg.height, self._cfg.target_fps,
-            self._cfg.min_exposure_us, self._cfg.analogue_gain,
-        )
+        self._exp.inject_camera(self._camera)
+        time.sleep(0.3)
+        log.info("Picamera2 ready: %dx%d @ %d fps, exp=%dµs gain=%.1f",
+                 self._cfg.width, self._cfg.height, self._cfg.target_fps,
+                 self._cfg.init_exposure_us, self._cfg.init_gain)
 
-    # ------------------------------------------------------------------
-    # Internal — acquisition loop
-    # ------------------------------------------------------------------
-
-    def _acquisition_loop(self) -> None:
-        """
-        Hot loop: capture frames as fast as possible (up to target_fps) and
-        push them onto the queue.  Drop oldest frame if downstream is slow.
-        """
-        frame_period = 1.0 / self._cfg.target_fps
-
+    def _loop(self) -> None:
+        period = 1.0 / self._cfg.target_fps
         while self._running:
             t0 = time.monotonic()
-
-            frame = self._capture_frame()
-
+            frame = self._capture()
             if frame is not None:
-                # Non-blocking put: discard oldest frame if queue full
-                if self._frame_queue.full():
-                    try:
-                        self._frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                self._frame_queue.put_nowait(frame)
-
-                # EMA FPS estimator
+                if self._q.full():
+                    try: self._q.get_nowait()
+                    except queue.Empty: pass
+                self._q.put_nowait(frame)
                 now = time.monotonic()
-                dt = now - self._last_ts
+                dt = now - self._last_t
                 if dt > 0:
-                    inst_fps = 1.0 / dt
-                    self._fps_ema = 0.1 * inst_fps + 0.9 * self._fps_ema
-                self._last_ts = now
-                self._frame_count += 1
-
-            # Pace to target FPS
+                    self._fps_ema = 0.1 * (1/dt) + 0.9 * self._fps_ema
+                self._last_t = now
             elapsed = time.monotonic() - t0
-            sleep_t = frame_period - elapsed
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+            sleep = period - elapsed
+            if sleep > 0:
+                time.sleep(sleep)
 
-    def _capture_frame(self) -> Optional[np.ndarray]:
-        """Capture one frame from hardware or synthesise a test frame."""
-        if self._camera is not None:
+    def _capture(self) -> Optional[np.ndarray]:
+        if self._camera:
             try:
-                arr = self._camera.capture_array("main")
-                return arr  # BGR uint8
-            except Exception as exc:
-                log.error("Frame capture error: %s", exc)
+                return self._camera.capture_array("main")
+            except Exception as e:
+                log.error("Capture error: %s", e)
                 return None
-        else:
-            return self._synthetic_ir_frame()
+        return self._synth_frame()
 
-    # ------------------------------------------------------------------
-    # Simulation / demo mode
-    # ------------------------------------------------------------------
-
-    def _synthetic_ir_frame(self) -> np.ndarray:
+    def _synth_frame(self) -> np.ndarray:
         """
-        Generate a physically plausible synthetic IR reflectance frame for
-        development / testing without hardware.
+        Physically plausible synthetic 850 nm reflectance frame.
 
-        The frame simulates:
-          - Gaussian-illuminated fingertip region (central ROI)
-          - Slight pulsatile intensity modulation (≈1 % AC)
-          - Gaussian shot noise (σ ≈ 3 LSB)
-          - Slow illumination drift to test stability scoring
+        Simulates:
+          • Gaussian fingertip blob (DC reflectance ≈ 130 LSB)
+          • 1% AC pulsatile component at ~1.1 Hz
+          • Secondary vascular shadow at ~1.5× cardiac frequency
+          • Shot noise (σ = 3 LSB)
+          • Slow illumination drift (< 0.5% over 60 s)
+          • Finger micro-motion (Brownian ±3 px, σ=0.5)
         """
         h, w = self._cfg.height, self._cfg.width
         t = time.monotonic()
 
-        # Background: very low IR reflection (optical isolation chamber)
-        frame = np.full((h, w), 12, dtype=np.float32)
+        frame = np.full((h, w), 10.0, dtype=np.float32)
 
-        # Fingertip Gaussian blob — centred, elliptical
-        cx, cy = w // 2, h // 2
-        sigma_x, sigma_y = w * 0.18, h * 0.28
+        # Micro-motion: small random displacement
+        dx = np.random.normal(0, 0.4)
+        dy = np.random.normal(0, 0.4)
+        cx = w / 2 + dx
+        cy = h / 2 + dy
+        sx, sy = w * 0.18, h * 0.28
 
         yy, xx = np.ogrid[:h, :w]
-        gauss = np.exp(
-            -((xx - cx) ** 2 / (2 * sigma_x ** 2) +
-              (yy - cy) ** 2 / (2 * sigma_y ** 2))
-        )
+        gauss = np.exp(-((xx - cx)**2 / (2*sx**2) + (yy - cy)**2 / (2*sy**2)))
 
-        # DC reflectance ≈ 130 LSB (≈ 51 % of 255)
-        dc_level = 130.0
+        dc      = 130.0
+        f_card  = 1.1   # Hz (~66 bpm placeholder — NOT a clinical measurement)
+        ac1     = dc * 0.012 * math.sin(2*math.pi * f_card * t)
+        ac2     = dc * 0.004 * math.sin(2*math.pi * f_card * 2 * t + 0.8)
+        drift   = dc * 0.005 * math.sin(2*math.pi * t / 60.0)
+        noise   = np.random.normal(0, 3.0, (h, w)).astype(np.float32)
 
-        # AC pulsatility: 1 % of DC at simulated ~1.1 Hz (66 bpm)
-        ac_component = dc_level * 0.01 * math.sin(2 * math.pi * 1.1 * t)
+        frame += gauss * (dc + ac1 + ac2 + drift) + noise
+        frame  = np.clip(frame, 0, 255).astype(np.uint8)
 
-        # Slow illumination drift (< 0.5 % over 60 s)
-        drift = dc_level * 0.005 * math.sin(2 * math.pi * t / 60.0)
-
-        frame += gauss * (dc_level + ac_component + drift)
-
-        # Shot noise (Poisson-like approximation via Gaussian)
-        noise = np.random.normal(0, 3.0, (h, w)).astype(np.float32)
-        frame += noise
-
-        frame = np.clip(frame, 0, 255).astype(np.uint8)
-
-        # Return as 3-channel BGR (pipeline expects colour input)
-        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR) if CV2_AVAILABLE \
-            else np.stack([frame, frame, frame], axis=-1)
+        if CV2_OK:
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        return np.stack([frame]*3, axis=-1)
 
 
-# ===========================================================================
-# § 4  IMAGE PROCESSING PIPELINE
-# ===========================================================================
+# =============================================================================
+# §7  IR IMAGE PROCESSOR
+# =============================================================================
 
 class IRImageProcessor:
     """
-    Research-grade image processing pipeline for 850 nm reflectance frames.
+    Converts raw BGR NoIR frames to processed grayscale IR images.
 
-    Processing stages (in order):
-      1. BGR → grayscale extraction (luminance-weighted)
-      2. Gaussian blur for shot-noise suppression
-      3. CLAHE adaptive histogram equalisation for visibility
-      4. Optional adaptive thresholding for structural analysis
-      5. Per-frame metric extraction
+    Stages:
+      1. IR-weighted channel merge (R×0.75, G×0.20, B×0.05)
+         Physical basis: OV5647/IMX219 QE at 850 nm peaks in red channel.
+      2. Gaussian blur — shot-noise suppression (σ≈1 px)
+      3. CLAHE — contrast-limited adaptive histogram equalisation
+         (improves low-contrast subsurface optical features)
+      4. Illumination normalisation (large-kernel blur divide)
     """
 
-    def __init__(self, cam_cfg: CameraConfig, opt_cfg: OpticalConfig,
-                 roi_cfg: ROIConfig, mot_cfg: MotionConfig):
-        self._cam = cam_cfg
-        self._opt = opt_cfg
-        self._roi = roi_cfg
-        self._mot = mot_cfg
+    def __init__(self, opt_cfg: OptCfg):
+        self._cfg = opt_cfg
+        self._clahe = (cv2.createCLAHE(
+            clipLimit=opt_cfg.clahe_clip,
+            tileGridSize=opt_cfg.clahe_tile) if CV2_OK else None)
 
-        # CLAHE engine — contrast-limited adaptive histogram equalisation
-        # improves low-contrast IR tissue features without over-amplifying noise
-        if CV2_AVAILABLE:
-            self._clahe = cv2.createCLAHE(
-                clipLimit=opt_cfg.clahe_clip_limit,
-                tileGridSize=opt_cfg.clahe_tile_grid,
-            )
-        else:
-            self._clahe = None
-
-        # Previous frame for motion detection
-        self._prev_gray: Optional[np.ndarray] = None
-
-        # Exponential moving-average motion score
-        self._motion_ema: float = 0.0
-
-        # ROI pixel coordinates (computed once from frame size)
-        self._roi_slice: Optional[Tuple[slice, slice]] = None
-
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
-
-    def process(self, bgr_frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, FrameMetrics]:
+    def process(self, bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Full pipeline for one frame.
-
         Returns:
-            gray_raw    — grayscale, blur-suppressed (for metric extraction)
-            gray_disp   — CLAHE-enhanced grayscale (for visualisation)
-            metrics     — populated FrameMetrics dataclass
+            gray_metric  — lightly blurred grayscale (for metric extraction)
+            gray_display — CLAHE-enhanced + normalised (for visualisation)
         """
-        metrics = FrameMetrics(timestamp=time.monotonic())
+        gray_raw = self._extract_ir(bgr)
 
-        # --- Stage 1: extract IR-channel grayscale ---
-        # For a NoIR camera, the red channel carries the most 850 nm signal
-        # (the Bayer filter passes ~50 % of IR to R pixels vs ~10–20 % for B).
-        # Using cv2.cvtColor gives luminance weighting (0.114 B + 0.587 G + 0.299 R),
-        # which is sub-optimal for pure IR.  We instead weight heavily toward R.
-        gray_raw = self._extract_ir_channel(bgr_frame)
-
-        # --- Stage 2: Gaussian blur (σ ≈ 1 px) ---
-        # Suppresses pixel-level shot noise before metric extraction.
-        k = self._opt.blur_kernel_size
-        if CV2_AVAILABLE:
-            gray_blurred = cv2.GaussianBlur(gray_raw, (k, k), 0)
+        k = self._cfg.blur_k
+        if CV2_OK:
+            gray_metric = cv2.GaussianBlur(gray_raw, (k, k), 0)
         else:
-            gray_blurred = gray_raw  # fallback: no-op
+            gray_metric = gray_raw.copy()
 
-        # --- Stage 3: CLAHE for display ---
+        # CLAHE display image
         if self._clahe is not None:
-            gray_disp = self._clahe.apply(gray_blurred)
+            gray_disp = self._clahe.apply(gray_metric)
         else:
-            gray_disp = gray_blurred.copy()
+            gray_disp = gray_metric.copy()
 
-        # --- Stage 4: whole-frame photometric metrics ---
-        self._compute_frame_metrics(gray_blurred, metrics)
+        # Illumination normalisation: divide by large-scale Gaussian background
+        if CV2_OK:
+            bg = cv2.GaussianBlur(gray_metric.astype(np.float32), (81, 81), 0) + 1.0
+            norm = np.clip(gray_metric.astype(np.float32) / bg * 128.0, 0, 255).astype(np.uint8)
+            # Blend normalised and CLAHE for best of both
+            gray_disp = cv2.addWeighted(gray_disp, 0.6, norm, 0.4, 0)
 
-        # --- Stage 5: motion / sharpness detection ---
-        self._compute_motion_metrics(gray_blurred, metrics)
+        return gray_metric, gray_disp
 
-        # --- Stage 6: ROI optical analysis ---
-        self._compute_roi_metrics(gray_blurred, bgr_frame, metrics)
-
-        # --- Stage 7: composite optical scores ---
-        self._compute_optical_scores(metrics)
-
-        return gray_raw, gray_disp, metrics
-
-    def compute_roi_coords(self, h: int, w: int) -> Tuple[int, int, int, int]:
-        """
-        Return (x1, y1, x2, y2) pixel coordinates of the central ROI.
-        Cached after first call.
-        """
-        rw = int(w * self._roi.roi_fraction_w)
-        rh = int(h * self._roi.roi_fraction_h)
-        x1 = (w - rw) // 2
-        y1 = (h - rh) // 2
-        return x1, y1, x1 + rw, y1 + rh
-
-    # ------------------------------------------------------------------
-    # Internal — channel extraction
-    # ------------------------------------------------------------------
-
-    def _extract_ir_channel(self, bgr: np.ndarray) -> np.ndarray:
-        """
-        Extract the IR-dominant channel from a BGR NoIR frame.
-
-        Physical rationale:
-          The OmniVision OV5647 / Sony IMX219 Bayer filter transmits visible
-          and NIR light to all colour channels, but with different spectral
-          sensitivities.  At 850 nm the red-channel quantum efficiency is
-          approximately 2–4× higher than blue.  Weighting toward R gives
-          better SNR for the IR signal.
-
-        Weights: B=0.05, G=0.20, R=0.75  (empirically tuned for 850 nm)
-        """
-        if not CV2_AVAILABLE:
+    def _extract_ir(self, bgr: np.ndarray) -> np.ndarray:
+        """Weighted channel merge optimised for 850 nm NoIR response."""
+        if not CV2_OK:
             return np.mean(bgr, axis=2).astype(np.uint8)
+        b = bgr[:,:,0].astype(np.float32)
+        g = bgr[:,:,1].astype(np.float32)
+        r = bgr[:,:,2].astype(np.float32)
+        ir = 0.05*b + 0.20*g + 0.75*r
+        return np.clip(ir, 0, 255).astype(np.uint8)
 
-        b = bgr[:, :, 0].astype(np.float32)
-        g = bgr[:, :, 1].astype(np.float32)
-        r = bgr[:, :, 2].astype(np.float32)
 
-        ir_weighted = 0.05 * b + 0.20 * g + 0.75 * r
-        return np.clip(ir_weighted, 0, 255).astype(np.uint8)
+# =============================================================================
+# §8  ADAPTIVE TISSUE SEGMENTER
+# =============================================================================
 
-    # ------------------------------------------------------------------
-    # Internal — metrics
-    # ------------------------------------------------------------------
+class AdaptiveTissueSegmenter:
+    """
+    Detects and tracks the fingertip ROI in the processed IR frame.
 
-    def _compute_frame_metrics(self, gray: np.ndarray, m: FrameMetrics) -> None:
-        """Compute whole-frame photometric statistics."""
-        flat = gray.ravel().astype(np.float32)
-        m.mean_intensity = float(np.mean(flat))
-        m.std_intensity = float(np.std(flat))
-        m.min_intensity = float(np.min(flat))
-        m.max_intensity = float(np.max(flat))
-        m.saturation_fraction = float(np.mean(flat >= 254))
+    Algorithm:
+      1. Search within a central crop of the frame.
+      2. Otsu threshold → morphological close → find contours.
+      3. Select largest contour with area ≥ min_area_frac of search area.
+      4. Fit an ellipse to the contour for sub-pixel accuracy.
+      5. Smooth ROI centre with EMA to suppress jitter.
+      6. Fall back to fixed central rectangle when segmentation fails.
 
-    def _compute_motion_metrics(self, gray: np.ndarray, m: FrameMetrics) -> None:
+    Confidence scoring:
+      • Contour area fraction normalised [0,1]
+      • Ellipse axis ratio (roundness) normalised [0,1]
+      • Combined as geometric mean
+    """
+
+    def __init__(self, seg_cfg: SegCfg, cam_cfg: CamCfg):
+        self._seg = seg_cfg
+        self._cam = cam_cfg
+        self._cx_ema: Optional[float] = None
+        self._cy_ema: Optional[float] = None
+        self._last_roi = ROIState()
+        self._seg_kernel = (cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (9, 9)) if CV2_OK else None)
+
+    def segment(self, gray: np.ndarray) -> Tuple[np.ndarray, ROIState]:
         """
-        Frame-difference motion detection + Laplacian sharpness.
-
-        Motion MAD (mean absolute difference between consecutive frames) is a
-        simple but effective motion artefact detector for slow-moving objects
-        such as a finger resting on the sensor aperture.  Blurry frames
-        (low Laplacian variance) indicate either motion smear or defocus.
-        """
-        alpha = self._mot.ema_alpha
-
-        # Laplacian variance — sharpness estimator
-        if CV2_AVAILABLE:
-            lap = cv2.Laplacian(gray, cv2.CV_64F)
-            m.laplacian_variance = float(lap.var())
-        else:
-            m.laplacian_variance = 50.0  # assume sharp in fallback
-
-        # Frame difference MAD
-        if self._prev_gray is not None and gray.shape == self._prev_gray.shape:
-            diff = np.abs(gray.astype(np.int16) - self._prev_gray.astype(np.int16))
-            m.motion_mad = float(np.mean(diff))
-        else:
-            m.motion_mad = 0.0
-
-        # EMA-smoothed motion score [0–1]
-        raw_motion = min(m.motion_mad / self._mot.motion_flag_threshold, 1.0)
-        self._motion_ema = alpha * raw_motion + (1 - alpha) * self._motion_ema
-        m.motion_score = self._motion_ema
-
-        self._prev_gray = gray.copy()
-
-    def _compute_roi_metrics(self, gray: np.ndarray, bgr: np.ndarray,
-                             m: FrameMetrics) -> None:
-        """
-        Extract optical metrics from the central fingertip ROI.
-
-        The ROI is a fixed central rectangle — in a calibrated system you
-        would adaptively fit an ellipse to the finger boundary.
+        Returns:
+            mask   — binary tissue mask (uint8, same size as gray)
+            roi    — ROIState with current best estimate
         """
         h, w = gray.shape
-        x1, y1, x2, y2 = self.compute_roi_coords(h, w)
-        roi = gray[y1:y2, x1:x2].astype(np.float32)
+        mask = np.zeros((h, w), dtype=np.uint8)
 
-        if roi.size == 0:
-            return
+        if not CV2_OK:
+            return mask, self._fallback_roi(h, w)
 
-        m.roi_mean = float(np.mean(roi))
-        m.roi_std = float(np.std(roi))
-        m.roi_variance = float(np.var(roi))
-        m.finger_present = m.roi_mean >= self._roi.presence_intensity_threshold
+        # Search crop
+        sw = int(w * self._seg.search_frac_w)
+        sh = int(h * self._seg.search_frac_h)
+        ox = (w - sw) // 2
+        oy = (h - sh) // 2
+        crop = gray[oy:oy+sh, ox:ox+sw]
 
-    def _compute_optical_scores(self, m: FrameMetrics) -> None:
+        # Otsu threshold
+        _, thresh = cv2.threshold(crop, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Morphological close — fills small holes in tissue region
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, self._seg_kernel)
+
+        # Contour detection
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return mask, self._fallback_roi(h, w)
+
+        # Select largest contour
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        search_area = sw * sh
+        area_frac = area / search_area
+
+        if area_frac < self._seg.min_area_frac:
+            return mask, self._fallback_roi(h, w)
+
+        # Shift contour back to full-frame coordinates
+        largest_full = largest + np.array([[[ox, oy]]])
+
+        # Fit ellipse (requires ≥ 5 points)
+        roi = ROIState()
+        ellipse = None
+        confidence = 0.0
+
+        if len(largest_full) >= 5:
+            try:
+                ellipse = cv2.fitEllipse(largest_full)
+                (ex, ey), (ma, mi), angle = ellipse
+                ratio = min(ma, mi) / (max(ma, mi) + 1e-6)
+                if ratio >= self._seg.ellipse_ratio_min:
+                    # EMA smoothing of centre
+                    alpha = self._seg.ema_alpha
+                    self._cx_ema = ex if self._cx_ema is None \
+                        else alpha*ex + (1-alpha)*self._cx_ema
+                    self._cy_ema = ey if self._cy_ema is None \
+                        else alpha*ey + (1-alpha)*self._cy_ema
+                    cx, cy = self._cx_ema, self._cy_ema
+                    half_w = int(max(ma, mi) / 2 * 1.1)
+                    half_h = int(min(ma, mi) / 2 * 1.5)
+                    roi.cx, roi.cy = cx, cy
+                    roi.x1 = int(np.clip(cx - half_w, 0, w-1))
+                    roi.y1 = int(np.clip(cy - half_h, 0, h-1))
+                    roi.x2 = int(np.clip(cx + half_w, 0, w-1))
+                    roi.y2 = int(np.clip(cy + half_h, 0, h-1))
+                    roi.ellipse = ellipse
+                    roi.from_segmentation = True
+                    confidence = math.sqrt(
+                        min(area_frac / 0.15, 1.0) * min(ratio / 0.5, 1.0)
+                    )
+                    roi.confidence = confidence
+                    # Draw tissue mask
+                    cv2.drawContours(mask, [largest_full], -1, 255, -1)
+                    self._last_roi = roi
+                    return mask, roi
+            except cv2.error:
+                pass
+
+        return mask, self._fallback_roi(h, w)
+
+    def _fallback_roi(self, h: int, w: int) -> ROIState:
+        rw = int(w * self._seg.fallback_frac_w)
+        rh = int(h * self._seg.fallback_frac_h)
+        x1 = (w - rw) // 2
+        y1 = (h - rh) // 2
+        roi = ROIState(
+            x1=x1, y1=y1, x2=x1+rw, y2=y1+rh,
+            cx=w/2, cy=h/2,
+            from_segmentation=False, confidence=0.0
+        )
+        self._last_roi = roi
+        return roi
+
+
+# =============================================================================
+# §9  MOTION DETECTOR
+# =============================================================================
+
+class MotionDetector:
+    """
+    Dual-metric motion detection:
+      1. Frame-difference MAD (mean absolute difference) — movement detector
+      2. Laplacian variance — sharpness / motion-blur detector
+
+    Both are EMA-smoothed for temporal stability.
+    """
+
+    def __init__(self, cfg: MotCfg):
+        self._cfg = cfg
+        self._prev: Optional[np.ndarray] = None
+        self._motion_ema: float = 0.0
+
+    def update(self, gray: np.ndarray) -> Tuple[float, float, float, bool]:
         """
-        Compute three composite optical quality scores, each in [0, 1].
-
-        optical_stability:
-          Penalises high motion score and low sharpness.
-
-        image_quality:
-          Rewards proper exposure (not too dark, not saturated) and sharpness.
-
-        optical_confidence:
-          Combined score gating whether downstream analysis is trustworthy.
+        Returns (motion_mad, laplacian_var, motion_score, is_corrupt).
         """
-        # --- Motion / stability ---
-        stability = 1.0 - m.motion_score
-        if m.laplacian_variance < self._mot.blur_threshold:
-            blur_penalty = m.laplacian_variance / self._mot.blur_threshold
+        alpha = self._cfg.ema_alpha
+
+        # Laplacian variance
+        if CV2_OK:
+            lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
         else:
-            blur_penalty = 1.0
-        m.optical_stability = float(np.clip(stability * blur_penalty, 0.0, 1.0))
+            lap_var = 50.0
 
-        # --- Image quality ---
-        # Penalise darkness (mean < 40) and saturation (> 5 % pixels at 255)
-        intensity_ok = np.clip(
-            (m.mean_intensity - 10.0) / (self._opt.expected_intensity_min - 10.0),
-            0.0, 1.0,
-        )
-        saturation_penalty = max(0.0, 1.0 - m.saturation_fraction * 20.0)
-        sharpness_norm = np.clip(m.laplacian_variance / 200.0, 0.0, 1.0)
-        m.image_quality = float(intensity_ok * saturation_penalty * (0.5 + 0.5 * sharpness_norm))
+        # Frame-difference MAD
+        if self._prev is not None and gray.shape == self._prev.shape:
+            mad = float(np.mean(np.abs(
+                gray.astype(np.int16) - self._prev.astype(np.int16)
+            )))
+        else:
+            mad = 0.0
 
-        # --- Overall optical confidence ---
-        finger_weight = 1.0 if m.finger_present else 0.3
-        m.optical_confidence = float(
-            m.optical_stability * 0.4
-            + m.image_quality * 0.4
-            + finger_weight * 0.2
-        )
+        self._prev = gray.copy()
+
+        raw_score = min(mad / max(self._cfg.motion_flag_mad, 1e-6), 1.0)
+        self._motion_ema = alpha * raw_score + (1 - alpha) * self._motion_ema
+
+        corrupt = (self._motion_ema > 0.55 or lap_var < self._cfg.blur_threshold)
+        return mad, lap_var, self._motion_ema, corrupt
 
 
-# ===========================================================================
-# § 5  REGION-OF-INTEREST OPTICAL SIGNAL TRACKER
-# ===========================================================================
+# =============================================================================
+# §10  OPTICAL SIGNAL EXTRACTOR (Butterworth Bandpass)
+# =============================================================================
 
-class OpticalSignalTracker:
+class OpticalSignalExtractor:
     """
-    Accumulates per-frame ROI mean intensities into a circular buffer and
-    computes derived temporal optical metrics.
+    Accumulates per-frame ROI mean intensities and applies a real-time
+    Butterworth bandpass filter (0.7–4 Hz) to isolate the experimental
+    optical pulsatility waveform.
 
-    The buffer is the raw experimental optical signal.  It intentionally
-    contains no bandpass filtering or cardiac inference — this is left as a
-    research task for downstream analysis.
+    Implementation notes:
+      • scipy.signal.sosfilt with persistent filter state (zi) for causal
+        real-time filtering — avoids end effects and latency of batch filtfilt.
+      • Detrending via 3rd-order polynomial fit on the buffer window prior to
+        filtering removes slow illumination drift (< 0.7 Hz).
+      • SNR estimated as 20·log10(DC_mean / AC_RMS).
+
+    DISCLAIMER: The AC component of this signal is an *experimental optical
+    pulsatility proxy*.  It must NOT be interpreted as a clinical measurement.
     """
 
-    def __init__(self, roi_cfg: ROIConfig):
-        self._cfg = roi_cfg
-        self._signal = OpticalSignalBuffer(maxlen=roi_cfg.signal_window)
-        self._good_frames = 0
-        self._total_frames = 0
+    def __init__(self, opt_cfg: OptCfg):
+        self._cfg = opt_cfg
+        self._raw_buf:  Deque[float] = collections.deque(maxlen=opt_cfg.signal_buf_len)
+        self._filt_buf: Deque[float] = collections.deque(maxlen=opt_cfg.signal_buf_len)
+        self._ts_buf:   Deque[float] = collections.deque(maxlen=opt_cfg.signal_buf_len)
+        self._sos: Optional[np.ndarray] = None
+        self._zi: Optional[np.ndarray] = None
+        self._fps_est: float = 30.0
+        self._fps_samples: Deque[float] = collections.deque(maxlen=30)
+        self._last_ts: float = 0.0
 
-    def update(self, metrics: FrameMetrics) -> None:
-        self._total_frames += 1
-        if metrics.finger_present and metrics.motion_score < 0.3:
-            self._signal.push(metrics.roi_mean, metrics.timestamp)
-            self._good_frames += 1
+    def push(self, roi_mean: float, ts: float, accept: bool) -> None:
+        """Push one sample; reject motion-corrupted frames."""
+        if not accept:
+            return
+        self._raw_buf.append(roi_mean)
+        self._ts_buf.append(ts)
 
-    @property
-    def signal_ac_rms(self) -> float:
-        return self._signal.signal_ac_rms()
+        # FPS estimation from timestamps
+        if self._last_ts > 0:
+            dt = ts - self._last_ts
+            if 0 < dt < 1.0:
+                self._fps_samples.append(1.0 / dt)
+        self._last_ts = ts
 
-    @property
-    def signal_snr_db(self) -> float:
-        return self._signal.signal_snr_db()
+        if len(self._fps_samples) >= 5:
+            self._fps_est = float(np.median(list(self._fps_samples)))
+
+        # Rebuild filter when FPS estimate has settled or changes significantly
+        self._ensure_filter()
+
+        # Real-time sample-by-sample Butterworth filtering
+        if self._sos is not None and self._zi is not None and len(self._raw_buf) >= 4:
+            sample = np.array([[roi_mean]], dtype=np.float64)
+            y, self._zi = sosfilt(self._sos, sample.ravel(), zi=self._zi)
+            self._filt_buf.append(float(y[0]))
+        else:
+            self._filt_buf.append(roi_mean)
+
+    def _ensure_filter(self) -> None:
+        if not SCIPY_OK:
+            return
+        fps = max(self._fps_est, 5.0)
+        nyq = fps / 2.0
+        lo = self._cfg.bp_low_hz / nyq
+        hi = self._cfg.bp_high_hz / nyq
+        if lo >= 1.0 or hi >= 1.0 or lo <= 0:
+            return
+        if self._sos is None:
+            self._sos = butter(self._cfg.bp_order, [lo, hi],
+                               btype='band', output='sos')
+            self._zi = sosfilt_zi(self._sos)[:, :, np.newaxis].squeeze(axis=2)
+            # sosfilt_zi returns shape (n_sections, 2); reshape for scalar input
+            # Actually for scalar input zi shape must be (n_sections, 2)
+            self._zi = sosfilt_zi(self._sos) * 0.0  # zero initial state
+
+    def metrics(self) -> Tuple[float, float, float, float]:
+        """
+        Returns (raw_latest, filtered_latest, ac_rms, snr_db).
+        All labelled non-clinical experimental values.
+        """
+        raw_latest  = self._raw_buf[-1]  if self._raw_buf  else 0.0
+        filt_latest = self._filt_buf[-1] if self._filt_buf else 0.0
+
+        if len(self._filt_buf) >= self._cfg.min_buf_for_filter:
+            fa = np.array(list(self._filt_buf), dtype=np.float32)
+            ac_rms = float(np.sqrt(np.mean(fa**2)))
+        else:
+            ac_rms = 0.0
+
+        if len(self._raw_buf) >= 4:
+            dc = float(np.mean(list(self._raw_buf)))
+            snr_db = 20.0 * math.log10(dc / (ac_rms + 1e-9) + 1e-9)
+        else:
+            snr_db = 0.0
+
+        return raw_latest, filt_latest, ac_rms, snr_db
 
     @property
     def buffer_fill(self) -> int:
-        return len(self._signal)
+        return len(self._raw_buf)
 
-    @property
-    def good_frame_ratio(self) -> float:
-        if self._total_frames == 0:
-            return 0.0
-        return self._good_frames / self._total_frames
+    def raw_array(self) -> np.ndarray:
+        return np.array(list(self._raw_buf), dtype=np.float32)
+
+    def filtered_array(self) -> np.ndarray:
+        return np.array(list(self._filt_buf), dtype=np.float32)
 
 
-# ===========================================================================
-# § 6  AI-ASSISTED OPTICAL INTERPRETATION
-# ===========================================================================
+# =============================================================================
+# §11  OPTICAL QUALITY ENGINE
+# =============================================================================
 
-class OpticalInterpreter:
+class OpticalQualityEngine:
     """
-    Lightweight rule-based optical quality interpreter.
+    Aggregates per-frame scalar metrics into a five-level quality
+    classification and normalised confidence score.
 
-    IMPORTANT: This module produces EXPERIMENTAL feedback on optical signal
-    quality only.  It makes no clinical, diagnostic, or physiological claims.
-    All outputs are labelled "non-clinical experimental analysis".
+    Classification logic (thresholds are empirically tuned for 850 nm
+    reflectance with 50 mA IR LED drive inside a black isolation chamber):
+
+        Confidence ≥ 0.80  →  EXCELLENT
+        Confidence ≥ 0.65  →  GOOD
+        Confidence ≥ 0.45  →  FAIR
+        Confidence ≥ 0.20  →  POOR
+        Otherwise          →  INVALID
     """
 
     @staticmethod
-    def interpret(m: FrameMetrics, tracker: OpticalSignalTracker) -> List[str]:
+    def evaluate(fd: FrameData) -> Tuple[float, float, float, OpticalQuality]:
         """
-        Return a list of human-readable interpretation strings based on current
-        optical metrics.  Each string begins with a severity tag:
-          [OK]   — nominal
-          [INFO] — advisory
-          [WARN] — quality concern
-          [ERR]  — critical quality failure
+        Returns (optical_stability, image_quality, optical_confidence, quality_class).
+        All scores in [0, 1].
         """
-        messages: List[str] = []
+        # ── Stability score ────────────────────────────────────────────────
+        motion_penalty = 1.0 - fd.motion_score
+        blur_ok = min(fd.laplacian_var / 30.0, 1.0)
+        stability = float(np.clip(motion_penalty * blur_ok, 0, 1))
 
-        # Finger presence
-        if not m.finger_present:
-            messages.append("[WARN] No tissue detected in ROI — place fingertip on aperture.")
+        # ── Image quality score ────────────────────────────────────────────
+        # Reward proper exposure; penalise darkness and saturation
+        intensity_score = np.clip(
+            (fd.mean_intensity - 8.0) / (35.0 - 8.0), 0.0, 1.0
+        )
+        saturation_penalty = max(0.0, 1.0 - fd.saturation_frac * 15.0)
+        sharpness_norm = min(fd.laplacian_var / 150.0, 1.0)
+        iq = float(intensity_score * saturation_penalty * (0.4 + 0.6 * sharpness_norm))
+
+        # ── ROI / segmentation bonus ───────────────────────────────────────
+        seg_bonus = 0.8 + 0.2 * fd.roi.confidence
+        finger_w  = seg_bonus if fd.finger_present else 0.25
+
+        # ── Signal quality contribution ────────────────────────────────────
+        if fd.signal_snr_db > 20:
+            sig_q = 1.0
+        elif fd.signal_snr_db > 10:
+            sig_q = (fd.signal_snr_db - 10) / 10.0
         else:
-            messages.append("[OK]   Tissue presence confirmed in optical ROI.")
+            sig_q = 0.0
 
-        # Motion artefacts
-        if m.motion_score > 0.6:
-            messages.append("[ERR]  Severe motion artefact — hold fingertip still.")
-        elif m.motion_score > 0.3:
-            messages.append("[WARN] Moderate motion detected — stabilise placement.")
+        # ── Weighted confidence ────────────────────────────────────────────
+        conf = float(
+            stability * 0.30
+            + iq       * 0.30
+            + finger_w * 0.25
+            + sig_q    * 0.15
+        )
+        conf = float(np.clip(conf, 0.0, 1.0))
+
+        # ── Classification ────────────────────────────────────────────────
+        if   conf >= 0.80: qc = OpticalQuality.EXCELLENT
+        elif conf >= 0.65: qc = OpticalQuality.GOOD
+        elif conf >= 0.45: qc = OpticalQuality.FAIR
+        elif conf >= 0.20: qc = OpticalQuality.POOR
+        else:              qc = OpticalQuality.INVALID
+
+        return stability, iq, conf, qc
+
+
+# =============================================================================
+# §12  AI-ASSISTED OPTICAL INTERPRETER
+# =============================================================================
+
+class OpticalInterpreter:
+    """
+    Rule-based optical interpretation engine.
+
+    Generates structured, non-clinical advisory messages based on current
+    optical metrics.  Output is explicitly labelled "experimental optical
+    analysis" — never a clinical or physiological claim.
+    """
+
+    @staticmethod
+    def interpret(fd: FrameData) -> List[str]:
+        msgs: List[str] = []
+
+        # Tissue presence
+        if not fd.finger_present:
+            msgs.append("[ERR]  No tissue in ROI — place fingertip on chamber aperture.")
+        elif fd.roi.from_segmentation and fd.roi.confidence > 0.6:
+            msgs.append(f"[OK]   Adaptive segmentation active (conf={fd.roi.confidence:.2f}).")
         else:
-            messages.append("[OK]   Low motion — optical coupling is stable.")
+            msgs.append("[INFO] Fixed-ROI fallback active — improve finger placement.")
 
-        # Illumination / exposure
-        if m.mean_intensity < 20:
-            messages.append("[ERR]  Frame underexposed — check IR LED drive current.")
-        elif m.mean_intensity < 40:
-            messages.append("[WARN] Low IR illumination — increase LED current or exposure.")
-        elif m.saturation_fraction > 0.1:
-            messages.append("[WARN] Partial saturation detected — reduce IR LED drive or gain.")
+        # Motion
+        if fd.motion_score > 0.60:
+            msgs.append("[ERR]  Severe motion artefact — hold still for stable signal.")
+        elif fd.motion_score > 0.35:
+            msgs.append("[WARN] Moderate motion — stabilise fingertip contact.")
         else:
-            messages.append("[OK]   Illumination level within experimental range.")
+            msgs.append("[OK]   Optical coupling stable — low motion artefact.")
 
-        # Sharpness
-        if m.laplacian_variance < 10:
-            messages.append("[ERR]  Severe blur — check focus, possible lens contamination.")
-        elif m.laplacian_variance < 25:
-            messages.append("[WARN] Low sharpness — verify optical alignment.")
-
-        # Signal quality (requires ≥ 2 s of data)
-        if tracker.buffer_fill >= 30:
-            snr = tracker.signal_snr_db
-            ac = tracker.signal_ac_rms
-            if snr < 20:
-                messages.append(
-                    f"[WARN] Signal SNR = {snr:.1f} dB — noisy optical signal."
-                )
-            else:
-                messages.append(
-                    f"[OK]   Signal SNR = {snr:.1f} dB, AC-RMS = {ac:.2f} LSB "
-                    f"(experimental optical signal)."
-                )
-
-        # Overall confidence
-        conf = m.optical_confidence
-        if conf > 0.75:
-            messages.append(f"[OK]   Optical confidence: {conf*100:.0f}% — analysis reliable.")
-        elif conf > 0.45:
-            messages.append(f"[INFO] Optical confidence: {conf*100:.0f}% — marginal quality.")
+        # Illumination
+        if fd.mean_intensity < 15:
+            msgs.append("[ERR]  Frame severely underexposed — verify LED drive circuit.")
+        elif fd.mean_intensity < 40:
+            msgs.append("[WARN] Low IR illumination — increase LED current or exposure.")
+        elif fd.saturation_frac > 0.08:
+            msgs.append("[WARN] Partial pixel saturation — reduce LED drive or gain.")
         else:
-            messages.append(f"[WARN] Optical confidence: {conf*100:.0f}% — poor coupling.")
+            msgs.append(f"[OK]   Illumination nominal (mean={fd.mean_intensity:.0f} LSB).")
 
-        return messages
+        # Adaptive exposure report
+        msgs.append(f"[INFO] AEC: exp={fd.current_exposure_us}µs  gain={fd.current_gain:.2f}×")
+
+        # Optical signal (non-clinical)
+        if fd.signal_snr_db > 20:
+            msgs.append(
+                f"[OK]   Experimental optical signal: SNR={fd.signal_snr_db:.1f}dB  "
+                f"AC-RMS={fd.signal_ac_rms:.2f}LSB  (non-clinical)")
+        elif fd.signal_snr_db > 10:
+            msgs.append(
+                f"[WARN] Marginal signal quality: SNR={fd.signal_snr_db:.1f}dB "
+                f"(non-clinical optical pulsatility proxy)")
+        else:
+            msgs.append("[WARN] Insufficient optical signal — awaiting stable buffer.")
+
+        # Overall quality classification
+        qc = fd.quality_class
+        qc_colours = {
+            OpticalQuality.EXCELLENT: "[OK]  ",
+            OpticalQuality.GOOD:      "[OK]  ",
+            OpticalQuality.FAIR:      "[INFO]",
+            OpticalQuality.POOR:      "[WARN]",
+            OpticalQuality.INVALID:   "[ERR] ",
+        }
+        msgs.append(
+            f"{qc_colours[qc]} Optical quality class: {qc.value}  "
+            f"(confidence={fd.optical_confidence*100:.0f}%)"
+        )
+
+        return msgs
 
 
-# ===========================================================================
-# § 7  TERMINAL DASHBOARD
-# ===========================================================================
+# =============================================================================
+# §13  TERMINAL DASHBOARD
+# =============================================================================
 
 class TerminalDashboard:
-    """
-    Engineering-style real-time terminal monitor.
+    """ANSI in-place updating engineering terminal dashboard (4 Hz refresh)."""
 
-    Uses ANSI escape sequences for in-place updating (no external dependency
-    on curses).  Refreshes at a fixed rate independent of the processing loop.
-    """
+    _CLR  = "\033[2J\033[H"
+    _B    = "\033[1m"
+    _R    = "\033[0m"
+    _G    = "\033[32m"
+    _Y    = "\033[33m"
+    _RED  = "\033[31m"
+    _C    = "\033[36m"
+    _M    = "\033[35m"
 
-    # ANSI codes
-    _CLR = "\033[2J\033[H"   # clear + home
-    _BOLD = "\033[1m"
-    _RST = "\033[0m"
-    _GRN = "\033[32m"
-    _YLW = "\033[33m"
-    _RED = "\033[31m"
-    _CYN = "\033[36m"
-    _WHT = "\033[37m"
+    _QC_COLOUR = {
+        OpticalQuality.EXCELLENT: "\033[32m",
+        OpticalQuality.GOOD:      "\033[32m",
+        OpticalQuality.FAIR:      "\033[33m",
+        OpticalQuality.POOR:      "\033[31m",
+        OpticalQuality.INVALID:   "\033[31m",
+    }
 
-    def __init__(self, opt_cfg: OpticalConfig, cam_cfg: CameraConfig):
+    def __init__(self, opt_cfg: OptCfg, cam_cfg: CamCfg):
         self._opt = opt_cfg
         self._cam = cam_cfg
-        self._start_time = time.monotonic()
+        self._t0 = time.monotonic()
 
-    def render(self, m: FrameMetrics, tracker: OpticalSignalTracker,
-               interpreter: OpticalInterpreter, cam_ok: bool) -> None:
-        """Clear screen and redraw the full dashboard."""
-        elapsed = time.monotonic() - self._start_time
-        mins, secs = divmod(int(elapsed), 60)
+    def render(self, fd: FrameData, sig: OpticalSignalExtractor,
+               interp: OpticalInterpreter, hw_cam: bool, hw_gpio: bool) -> None:
+        el = time.monotonic() - self._t0
+        mm, ss = divmod(int(el), 60)
+        B, R, G, Y, RE, C, M = self._B,self._R,self._G,self._Y,self._RED,self._C,self._M
 
-        lines: List[str] = []
-        B, R, G, Y, C, W = self._BOLD, self._RST, self._GRN, self._YLW, self._CYN, self._WHT
+        def bar(v: float, w: int = 18) -> str:
+            f = int(np.clip(v, 0, 1) * w)
+            return f"[{'█'*f}{'░'*(w-f)}] {v*100:5.1f}%"
 
-        # ── Header ────────────────────────────────────────────────────────────
-        lines.append(f"{B}{C}{'═'*70}{R}")
-        lines.append(
-            f"{B}{C}  NoIR BIOMEDICAL OPTICAL SENSING SYSTEM  "
-            f"│  λ={self._opt.ir_wavelength_nm} nm  │  {mins:02d}:{secs:02d}{R}"
-        )
-        lines.append(f"{B}{C}  Experimental Research Platform — NON-CLINICAL{R}")
-        lines.append(f"{B}{C}{'─'*70}{R}")
+        ln: List[str] = []
+        ln.append(f"{B}{C}{'═'*72}{R}")
+        ln.append(f"{B}{C}  NoIR BIOMEDICAL OPTICAL SENSING SYSTEM  v2  │  "
+                  f"λ={self._opt.ir_wavelength_nm}nm  │  {mm:02d}:{ss:02d}{R}")
+        ln.append(f"{B}{C}  Experimental Research Platform — NON-CLINICAL USE ONLY{R}")
+        ln.append(f"{B}{C}{'─'*72}{R}")
 
-        # ── Camera status ──────────────────────────────────────────────────────
-        cam_str = f"{G}CONNECTED (hw){R}" if cam_ok else f"{Y}SIMULATION{R}"
-        lines.append(f"  Camera Status   : {cam_str}")
-        lines.append(f"  Frame Rate      : {B}{m.fps:5.1f}{R} fps  "
-                     f"(target {self._cam.target_fps} fps)")
-        lines.append(f"  Frame Index     : {m.frame_index:,}")
+        # Hardware status
+        cam_s = f"{G}HW CAMERA{R}" if hw_cam else f"{Y}SIMULATION{R}"
+        gpio_s = f"{G}GPIO ACTIVE{R}" if hw_gpio else f"{Y}GPIO SIM{R}"
+        ln.append(f"  Camera: {cam_s}   LED Control: {gpio_s}   "
+                  f"Mode: {B}{fd.illum_mode.name}{R}")
+        ln.append(f"  Frame #{fd.frame_idx:,}   FPS: {B}{fd.fps:4.1f}{R}   "
+                  f"Target: {self._cam.target_fps}")
 
-        lines.append(f"{C}{'─'*70}{R}")
+        ln.append(f"{C}{'─'*72}{R}")
 
-        # ── Illumination & exposure ────────────────────────────────────────────
-        exp_colour = G if 40 <= m.mean_intensity <= 210 else Y if m.mean_intensity > 0 else R
-        lines.append(f"  Mean IR Intensity   : {exp_colour}{m.mean_intensity:6.1f}{R} / 255 LSB")
-        lines.append(f"  Std Dev Intensity   : {m.std_intensity:6.1f} LSB")
-        sat_c = R if m.saturation_fraction > 0.05 else G
-        lines.append(f"  Saturation Fraction : {sat_c}{m.saturation_fraction*100:5.1f}%{R}")
-        lines.append(f"  Illumination Status : "
-                     + (f"{G}NOMINAL{R}" if 40 <= m.mean_intensity <= 210 else f"{Y}CHECK LEDs{R}"))
+        # Adaptive exposure
+        exp_c = G if 40 <= fd.mean_intensity <= 210 else Y
+        ln.append(f"  Adaptive Exposure Control (AEC)")
+        ln.append(f"    ExposureTime  : {B}{fd.current_exposure_us:,}{R} µs")
+        ln.append(f"    AnalogueGain  : {B}{fd.current_gain:.2f}{R} ×")
+        ln.append(f"    Mean Intensity: {exp_c}{fd.mean_intensity:6.1f}{R} LSB  "
+                  f"(target {self._opt.target_roi_intensity:.0f})")
+        ln.append(f"    Saturation    : {fd.saturation_frac*100:5.2f}%   "
+                  f"Laplacian Var: {fd.laplacian_var:7.1f}")
 
-        lines.append(f"{C}{'─'*70}{R}")
+        ln.append(f"{C}{'─'*72}{R}")
 
-        # ── ROI analysis ───────────────────────────────────────────────────────
-        fp_str = f"{G}PRESENT{R}" if m.finger_present else f"{R}ABSENT {R}"
-        lines.append(f"  ROI Status      : {fp_str}")
-        lines.append(f"  ROI Mean        : {B}{m.roi_mean:6.1f}{R} LSB")
-        lines.append(f"  ROI Std Dev     : {m.roi_std:6.2f} LSB")
-        lines.append(f"  ROI Variance    : {m.roi_variance:8.1f} LSB²")
+        # ROI / segmentation
+        fp_s = f"{G}PRESENT{R}" if fd.finger_present else f"{RE}ABSENT{R}"
+        seg_s = f"{G}ELLIPSE FIT{R}" if fd.roi.from_segmentation else f"{Y}FALLBACK{R}"
+        ln.append(f"  ROI / Segmentation")
+        ln.append(f"    Tissue Status : {fp_s}   ROI Mode: {seg_s}")
+        ln.append(f"    Seg Confidence: {fd.roi.confidence*100:5.1f}%   "
+                  f"Centre: ({fd.roi.cx:.0f}, {fd.roi.cy:.0f}) px")
+        ln.append(f"    ROI Mean      : {B}{fd.roi_mean:6.1f}{R} LSB   "
+                  f"ROI Std: {fd.roi_std:5.2f}")
 
-        lines.append(f"{C}{'─'*70}{R}")
+        ln.append(f"{C}{'─'*72}{R}")
 
-        # ── Motion & stability ────────────────────────────────────────────────
-        mot_c = G if m.motion_score < 0.2 else Y if m.motion_score < 0.5 else R
-        lines.append(f"  Motion Score    : {mot_c}{m.motion_score:5.3f}{R}  (0=still, 1=heavy)")
-        lines.append(f"  Motion MAD      : {m.motion_mad:5.1f} LSB")
-        lines.append(f"  Laplacian Var   : {m.laplacian_variance:7.1f}  (sharpness proxy)")
+        # Motion
+        mot_c = G if fd.motion_score < 0.2 else Y if fd.motion_score < 0.5 else RE
+        ln.append(f"  Motion & Stability")
+        ln.append(f"    Motion MAD    : {fd.motion_mad:5.1f} LSB   "
+                  f"Score: {mot_c}{fd.motion_score:.3f}{R}")
+        ln.append(f"    Frame Corrupt : {RE+'YES'+R if fd.is_motion_corrupt else G+'NO '+R}")
+        stab_c = G if fd.optical_stability > 0.7 else Y if fd.optical_stability > 0.4 else RE
+        ln.append(f"    Optical Stab. : {stab_c}{bar(fd.optical_stability)}{R}")
 
-        lines.append(f"{C}{'─'*70}{R}")
+        ln.append(f"{C}{'─'*72}{R}")
 
-        # ── Composite optical scores ───────────────────────────────────────────
-        def bar(v: float, w: int = 20) -> str:
-            filled = int(v * w)
-            return f"[{'█'*filled}{'░'*(w-filled)}] {v*100:5.1f}%"
+        # Optical signal (non-clinical)
+        ln.append(f"  Experimental Optical Signal  (non-clinical waveform)")
+        ln.append(f"    Buffer Fill   : {sig.buffer_fill:3d}/{self._opt.signal_buf_len}  "
+                  f"Filter: {'Butterworth BP' if SCIPY_OK else 'UNAVAILABLE'} "
+                  f"[{self._opt.bp_low_hz:.1f}–{self._opt.bp_high_hz:.1f} Hz]")
+        ln.append(f"    Raw Latest    : {fd.raw_signal_latest:7.2f} LSB")
+        ln.append(f"    Filtered      : {fd.filtered_signal_latest:+7.3f} LSB  (AC component)")
+        ln.append(f"    AC-RMS        : {fd.signal_ac_rms:7.3f} LSB  (optical pulsatility proxy)")
+        snr_c = G if fd.signal_snr_db > 20 else Y if fd.signal_snr_db > 10 else RE
+        ln.append(f"    Signal SNR    : {snr_c}{fd.signal_snr_db:6.1f}{R} dB  (experimental)")
+        ln.append(f"    Pulsatility   : {bar(fd.pulsatility_confidence)}")
 
-        stab_c = G if m.optical_stability > 0.7 else Y if m.optical_stability > 0.4 else R
-        qual_c = G if m.image_quality > 0.7 else Y if m.image_quality > 0.4 else R
-        conf_c = G if m.optical_confidence > 0.7 else Y if m.optical_confidence > 0.4 else R
+        ln.append(f"{C}{'─'*72}{R}")
 
-        lines.append(f"  Optical Stability : {stab_c}{bar(m.optical_stability)}{R}")
-        lines.append(f"  Image Quality     : {qual_c}{bar(m.image_quality)}{R}")
-        lines.append(f"  Optical Confidence: {conf_c}{bar(m.optical_confidence)}{R}")
+        # Composite scores
+        iq_c = G if fd.image_quality > 0.7 else Y if fd.image_quality > 0.4 else RE
+        conf_c = G if fd.optical_confidence > 0.7 else Y if fd.optical_confidence > 0.4 else RE
+        qc_c = self._QC_COLOUR.get(fd.quality_class, RE)
+        ln.append(f"  Optical Quality Engine")
+        ln.append(f"    Image Quality : {iq_c}{bar(fd.image_quality)}{R}")
+        ln.append(f"    Confidence    : {conf_c}{bar(fd.optical_confidence)}{R}")
+        ln.append(f"    Classification: {qc_c}{B}{fd.quality_class.value:10s}{R}")
 
-        lines.append(f"{C}{'─'*70}{R}")
+        ln.append(f"{C}{'─'*72}{R}")
 
-        # ── Optical signal buffer ──────────────────────────────────────────────
-        lines.append(f"  Signal Buffer   : {tracker.buffer_fill:3d} / {tracker._signal.maxlen} frames")
-        lines.append(f"  Signal AC-RMS   : {tracker.signal_ac_rms:6.3f} LSB  (optical pulsatility proxy)")
-        lines.append(f"  Signal SNR      : {tracker.signal_snr_db:6.1f} dB  (experimental)")
-        lines.append(f"  Good Frame Ratio: {tracker.good_frame_ratio*100:5.1f}%")
+        # AI interpretation
+        ln.append(f"{B}  AI-ASSISTED OPTICAL INTERPRETATION  (non-clinical){R}")
+        msgs = OpticalInterpreter.interpret(fd)
+        for msg in msgs[:7]:
+            c = G if "[OK]" in msg else Y if "[WARN]" in msg or "[INFO]" in msg else RE
+            ln.append(f"    {c}{msg}{R}")
 
-        lines.append(f"{C}{'─'*70}{R}")
+        ln.append(f"{B}{C}{'═'*72}{R}")
+        ln.append("  Press  Q / ESC  in OpenCV window  or  Ctrl-C  to quit.")
 
-        # ── AI interpretation ──────────────────────────────────────────────────
-        lines.append(f"{B}  AI-ASSISTED OPTICAL INTERPRETATION  (non-clinical){R}")
-        interp = interpreter.interpret(m, tracker)
-        for msg in interp[:6]:  # show up to 6 messages
-            tag = msg[:6]
-            colour = G if "[OK]" in tag else Y if "[INFO]" in tag or "[WARN]" in tag else R
-            lines.append(f"    {colour}{msg}{R}")
-
-        lines.append(f"{B}{C}{'═'*70}{R}")
-        lines.append("  Press  Q  in the OpenCV window  or  Ctrl-C  to exit.")
-
-        # Print all at once after clearing screen
-        print(self._CLR + "\n".join(lines), end="", flush=True)
+        print(self._CLR + "\n".join(ln), end="", flush=True)
 
 
-# ===========================================================================
-# § 8  OPENCV VISUALISATION
-# ===========================================================================
+# =============================================================================
+# §14  OPENCV RESEARCH VISUALISER
+# =============================================================================
 
 class IRVisualiser:
     """
-    Real-time OpenCV window displaying the processed IR frame with research-
-    grade overlays.
+    OpenCV research-grade visualisation window.
+
+    Layout:
+      ┌─────────────────────────────────────┐
+      │                                     │
+      │   Processed IR frame + overlays     │  ← cam height
+      │                                     │
+      ├─────────────────────────────────────┤
+      │   Raw waveform strip                │  ← 55 px
+      ├─────────────────────────────────────┤
+      │   Filtered waveform strip           │  ← 55 px
+      └─────────────────────────────────────┘
 
     Overlays:
-      • Central ROI bounding rectangle
-      • Optical signal time-series mini-plot (bottom strip)
-      • Per-frame metric text
-      • Motion / quality colour-coded badge
+      • Adaptive ROI (green if finger, blue if fallback)
+      • Segmentation ellipse (cyan)
+      • Tissue mask semi-transparent fill
+      • Per-frame metric text panel (top-left)
+      • Motion / quality badge (top-right)
+      • Illumination mode badge (top-centre)
+      • Watermark (bottom-left)
     """
 
-    WINDOW_NAME = "NoIR BioSensor | 850nm IR Reflectance | EXPERIMENTAL"
+    WIN = "NoIR BioSensor v2 | 850nm IR Reflectance | EXPERIMENTAL"
 
-    def __init__(self, cam_cfg: CameraConfig, processor: IRImageProcessor):
+    def __init__(self, cam_cfg: CamCfg):
         self._cam = cam_cfg
-        self._proc = processor
-        self._initialized = False
-        self._signal_history: Deque[float] = collections.deque(maxlen=200)
+        self._raw_hist:  Deque[float] = collections.deque(maxlen=256)
+        self._filt_hist: Deque[float] = collections.deque(maxlen=256)
+        self._ready = False
 
     def init(self) -> None:
-        if CV2_AVAILABLE:
-            cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.WINDOW_NAME, self._cam.width, self._cam.height + 80)
-            self._initialized = True
+        if not CV2_OK:
+            return
+        cv2.namedWindow(self.WIN, cv2.WINDOW_NORMAL)
+        total_h = self._cam.height + 110
+        cv2.resizeWindow(self.WIN, self._cam.width, total_h)
+        self._ready = True
 
-    def render(self, gray_disp: np.ndarray, metrics: FrameMetrics) -> bool:
-        """
-        Draw overlays and display frame.
-
-        Returns False if the user pressed Q (quit signal).
-        """
-        if not CV2_AVAILABLE or not self._initialized:
+    def render(self, gray_disp: np.ndarray, mask: np.ndarray,
+               fd: FrameData, sig: OpticalSignalExtractor) -> bool:
+        if not CV2_OK or not self._ready:
             return True
 
-        # Convert grayscale to BGR for coloured overlays
+        h, w = gray_disp.shape
         vis = cv2.cvtColor(gray_disp, cv2.COLOR_GRAY2BGR)
 
-        h, w = vis.shape[:2]
+        # ── Tissue mask overlay (semi-transparent green) ────────────────────
+        if mask is not None and mask.any():
+            overlay = vis.copy()
+            overlay[mask > 0] = (0, 80, 0)
+            vis = cv2.addWeighted(vis, 0.75, overlay, 0.25, 0)
 
-        # ── ROI rectangle ──────────────────────────────────────────────────────
-        x1, y1, x2, y2 = self._proc.compute_roi_coords(h, w)
-        roi_colour = (0, 220, 0) if metrics.finger_present else (0, 80, 200)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), roi_colour, 2)
-        cv2.putText(vis, "ROI", (x1 + 4, y1 + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, roi_colour, 1)
+        # ── ROI rectangle ───────────────────────────────────────────────────
+        r = fd.roi
+        roi_col = (0, 220, 50) if fd.finger_present else (30, 100, 200)
+        roi_lw  = 2 if r.from_segmentation else 1
+        cv2.rectangle(vis, (r.x1, r.y1), (r.x2, r.y2), roi_col, roi_lw)
 
-        # ── Top-left metric overlay ────────────────────────────────────────────
-        overlay_lines = [
-            f"FPS: {metrics.fps:4.1f}",
-            f"IR mean: {metrics.mean_intensity:5.1f} LSB",
-            f"ROI mean: {metrics.roi_mean:5.1f} LSB",
-            f"Stability: {metrics.optical_stability*100:4.0f}%",
-            f"Confidence: {metrics.optical_confidence*100:4.0f}%",
-            f"Motion: {metrics.motion_score:4.3f}",
+        # ── Ellipse overlay ─────────────────────────────────────────────────
+        if r.ellipse is not None:
+            try:
+                cv2.ellipse(vis, r.ellipse, (0, 210, 210), 1)
+            except cv2.error:
+                pass
+
+        # ── Metric panel (top-left) ─────────────────────────────────────────
+        panel_lines = [
+            f"FPS {fd.fps:4.1f}",
+            f"IR  {fd.mean_intensity:5.1f}",
+            f"ROI {fd.roi_mean:5.1f}",
+            f"Stb {fd.optical_stability*100:4.0f}%",
+            f"Conf{fd.optical_confidence*100:4.0f}%",
+            f"Mot {fd.motion_score:.3f}",
+            f"SNR {fd.signal_snr_db:4.1f}dB",
         ]
-        bg_h = len(overlay_lines) * 18 + 8
-        overlay_bg = vis[4:4+bg_h, 4:180].copy()
-        cv2.rectangle(vis, (4, 4), (180, 4 + bg_h), (10, 10, 10), -1)
-        for i, txt in enumerate(overlay_lines):
-            cv2.putText(vis, txt, (8, 20 + i * 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 230, 200), 1)
+        ph = len(panel_lines) * 17 + 6
+        cv2.rectangle(vis, (2, 2), (138, 2+ph), (8, 8, 8), -1)
+        for i, txt in enumerate(panel_lines):
+            cv2.putText(vis, txt, (6, 17 + i*17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (190, 230, 190), 1)
 
-        # ── Motion badge (top-right) ───────────────────────────────────────────
-        if metrics.motion_score > 0.5:
-            badge_colour = (0, 0, 210)
-            badge_txt = "MOTION"
-        elif not metrics.finger_present:
-            badge_colour = (0, 120, 210)
-            badge_txt = "NO TISSUE"
-        else:
-            badge_colour = (0, 150, 0)
-            badge_txt = "STABLE"
-        cv2.rectangle(vis, (w - 110, 4), (w - 4, 26), badge_colour, -1)
-        cv2.putText(vis, badge_txt, (w - 108, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1)
+        # ── Quality badge (top-right) ───────────────────────────────────────
+        qc = fd.quality_class
+        qc_colours_bgr = {
+            OpticalQuality.EXCELLENT: (0, 200, 0),
+            OpticalQuality.GOOD:      (0, 180, 20),
+            OpticalQuality.FAIR:      (0, 180, 200),
+            OpticalQuality.POOR:      (0, 100, 210),
+            OpticalQuality.INVALID:   (0, 0, 200),
+        }
+        qc_col = qc_colours_bgr.get(qc, (0, 0, 200))
+        cv2.rectangle(vis, (w-118, 2), (w-2, 22), qc_col, -1)
+        cv2.putText(vis, qc.value, (w-116, 17),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (240, 240, 240), 1)
 
-        # ── Bottom: optical signal strip plot ──────────────────────────────────
-        self._signal_history.append(metrics.roi_mean)
-        vis = self._draw_signal_strip(vis, w)
+        # ── Illumination mode badge (top-centre) ────────────────────────────
+        mode_txt = fd.illum_mode.name
+        tw = cv2.getTextSize(mode_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)[0][0]
+        mx = (w - tw) // 2
+        cv2.rectangle(vis, (mx-4, 2), (mx+tw+4, 20), (40, 40, 80), -1)
+        cv2.putText(vis, mode_txt, (mx, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 255), 1)
 
-        # ── Watermark ─────────────────────────────────────────────────────────
-        cv2.putText(vis, "EXPERIMENTAL — NON-CLINICAL", (4, h - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (60, 60, 180), 1)
+        # ── Motion warning banner ────────────────────────────────────────────
+        if fd.is_motion_corrupt:
+            cv2.rectangle(vis, (0, h-28), (w, h), (0, 0, 180), -1)
+            cv2.putText(vis, "MOTION ARTEFACT — frame rejected", (6, h-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
 
-        cv2.imshow(self.WINDOW_NAME, vis)
+        # ── Watermark ────────────────────────────────────────────────────────
+        cv2.putText(vis, "EXPERIMENTAL | NON-CLINICAL | 850 nm IR REFLECTANCE",
+                    (2, h-6), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (60, 60, 150), 1)
+
+        # ── Signal strips ────────────────────────────────────────────────────
+        self._raw_hist.append(fd.raw_signal_latest)
+        self._filt_hist.append(fd.filtered_signal_latest)
+        raw_strip  = self._make_strip(w, 55, list(self._raw_hist),
+                                       (0, 200, 80),  "Raw optical signal (ROI mean)")
+        filt_strip = self._make_strip(w, 55, list(self._filt_hist),
+                                       (0, 140, 220), f"Butterworth BP [{sig._cfg.bp_low_hz:.1f}–{sig._cfg.bp_high_hz:.1f} Hz] — experimental non-clinical waveform")
+
+        combined = np.vstack([vis, raw_strip, filt_strip])
+        cv2.imshow(self.WIN, combined)
 
         key = cv2.waitKey(1) & 0xFF
-        return key not in (ord("q"), ord("Q"), 27)  # ESC or Q → quit
+        return key not in (ord('q'), ord('Q'), 27)
 
-    def _draw_signal_strip(self, vis: np.ndarray, w: int) -> np.ndarray:
-        """
-        Append a 60-pixel-tall optical signal trace below the camera frame,
-        forming a continuous combined image.
-        """
-        strip_h = 60
-        strip = np.zeros((strip_h, w, 3), dtype=np.uint8)
-        strip[:] = (15, 15, 15)  # near-black background
-
-        sig = np.array(self._signal_history, dtype=np.float32)
-        if len(sig) < 2:
-            return np.vstack([vis, strip])
-
-        # Normalise to strip height
-        sig_min, sig_max = sig.min(), sig.max()
-        if sig_max - sig_min < 1.0:
-            sig_norm = np.full_like(sig, strip_h // 2)
-        else:
-            sig_norm = (sig - sig_min) / (sig_max - sig_min) * (strip_h - 8) + 4
-
-        # Resample to frame width
-        x_src = np.linspace(0, len(sig_norm) - 1, w)
-        y_vals = np.interp(x_src, np.arange(len(sig_norm)), sig_norm).astype(int)
-
-        # Draw polyline
-        pts = np.array(
-            [[xi, strip_h - 1 - yi] for xi, yi in enumerate(y_vals)],
-            dtype=np.int32,
-        )
-        cv2.polylines(strip, [pts], False, (0, 200, 120), 1)
-
-        # Label
-        cv2.putText(strip, "Optical Signal (ROI mean, experimental)", (4, 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 180, 120), 1)
-
-        return np.vstack([vis, strip])
+    @staticmethod
+    def _make_strip(w: int, h: int, data: List[float],
+                    colour: Tuple, label: str) -> np.ndarray:
+        strip = np.zeros((h, w, 3), dtype=np.uint8)
+        strip[:] = (12, 12, 12)
+        if len(data) < 2:
+            return strip
+        arr = np.array(data, dtype=np.float32)
+        lo, hi = arr.min(), arr.max()
+        rng = hi - lo if hi - lo > 0.1 else 1.0
+        norm = (arr - lo) / rng * (h - 10) + 5
+        x_idx = np.linspace(0, len(norm)-1, w)
+        y_vals = np.interp(x_idx, np.arange(len(norm)), norm).astype(int)
+        pts = np.array([[xi, h-1-int(yi)] for xi, yi in enumerate(y_vals)],
+                       dtype=np.int32)
+        cv2.polylines(strip, [pts], False, colour, 1)
+        cv2.putText(strip, label, (4, 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (c*2//3 for c in colour), 1)
+        return strip
 
     def close(self) -> None:
-        if CV2_AVAILABLE:
+        if CV2_OK:
             cv2.destroyAllWindows()
 
 
-# ===========================================================================
-# § 9  MAIN SYSTEM CONTROLLER
-# ===========================================================================
+# =============================================================================
+# §15  ILLUMINATION CYCLE SCHEDULER
+# =============================================================================
 
-class NoIRBioSensorSystem:
+class IlluminationScheduler:
     """
-    Top-level coordinator that wires together all subsystems and runs the
-    main processing loop.
+    Optionally cycles through illumination modes to enable differential
+    reflectance comparison (IR vs White vs Hybrid).
+
+    In AUTO mode it advances every N seconds.
+    In FIXED mode it stays on a single mode.
+    """
+
+    def __init__(self, led: IlluminationController,
+                 mode_sequence: Optional[List[IlluminationMode]] = None,
+                 dwell_s: float = 5.0, auto: bool = False):
+        self._led = led
+        self._sequence = mode_sequence or [IlluminationMode.IR_ONLY]
+        self._dwell = dwell_s
+        self._auto = auto
+        self._idx = 0
+        self._last_switch = time.monotonic()
+        self._led.set_mode(self._sequence[0])
+
+    def tick(self) -> IlluminationMode:
+        if self._auto and len(self._sequence) > 1:
+            now = time.monotonic()
+            if now - self._last_switch >= self._dwell:
+                self._idx = (self._idx + 1) % len(self._sequence)
+                self._led.set_mode(self._sequence[self._idx])
+                self._last_switch = now
+        return self._sequence[self._idx]
+
+    def current_mode(self) -> IlluminationMode:
+        return self._sequence[self._idx]
+
+
+# =============================================================================
+# §16  MAIN SYSTEM CONTROLLER
+# =============================================================================
+
+class NoIRBioSensorSystemV2:
+    """
+    Top-level system controller — wires all subsystems and runs the main loop.
 
     Thread model:
-      • Main thread   — image processing, scoring, visualisation, dashboard
-      • cam-acq thread — Picamera2 acquisition (started by CameraAcquisition)
+      cam-acq  (daemon) — Picamera2 acquisition at target fps
+      main             — full processing pipeline + dashboard + visualisation
     """
 
-    def __init__(self) -> None:
-        # Instantiate configuration objects
-        self._cam_cfg = CameraConfig()
-        self._opt_cfg = OpticalConfig()
-        self._roi_cfg = ROIConfig()
-        self._mot_cfg = MotionConfig()
+    def __init__(self, illum_auto: bool = False):
+        # ── Configuration ────────────────────────────────────────────────────
+        self._cam_cfg = CamCfg()
+        self._opt_cfg = OptCfg()
+        self._seg_cfg = SegCfg()
+        self._mot_cfg = MotCfg()
+        self._gpio_cfg = GPIOCfg()
 
-        # Subsystems
-        self._acquisition = CameraAcquisition(self._cam_cfg)
-        self._processor = IRImageProcessor(
-            self._cam_cfg, self._opt_cfg, self._roi_cfg, self._mot_cfg
-        )
-        self._tracker = OpticalSignalTracker(self._roi_cfg)
-        self._interpreter = OpticalInterpreter()
+        # ── Subsystems ───────────────────────────────────────────────────────
+        self._led       = IlluminationController(self._gpio_cfg)
+        self._exp_ctrl  = AdaptiveExposureController(self._cam_cfg, self._opt_cfg)
+        self._camera    = CameraAcquisition(self._cam_cfg, self._exp_ctrl)
+        self._processor = IRImageProcessor(self._opt_cfg)
+        self._segmenter = AdaptiveTissueSegmenter(self._seg_cfg, self._cam_cfg)
+        self._motion    = MotionDetector(self._mot_cfg)
+        self._signal    = OpticalSignalExtractor(self._opt_cfg)
+        self._quality   = OpticalQualityEngine()
+        self._interp    = OpticalInterpreter()
         self._dashboard = TerminalDashboard(self._opt_cfg, self._cam_cfg)
-        self._visualiser = IRVisualiser(self._cam_cfg, self._processor)
+        self._vis       = IRVisualiser(self._cam_cfg)
+        self._scheduler = IlluminationScheduler(
+            self._led,
+            mode_sequence=[IlluminationMode.IR_ONLY,
+                           IlluminationMode.WHITE_ONLY,
+                           IlluminationMode.HYBRID],
+            dwell_s=8.0,
+            auto=illum_auto,
+        )
 
-        # State
+        # ── State ────────────────────────────────────────────────────────────
         self._running = False
-        self._frame_index = 0
-        self._last_dashboard_t = 0.0
-        self._dashboard_interval = 0.25   # update terminal at 4 Hz
+        self._frame_idx = 0
+        self._last_dash_t = 0.0
+        self._dash_interval = 0.25   # 4 Hz terminal refresh
 
-        # Graceful shutdown
-        signal.signal(signal.SIGINT, self._handle_sigint)
-        signal.signal(signal.SIGTERM, self._handle_sigint)
+        signal.signal(signal.SIGINT,  self._sighandler)
+        signal.signal(signal.SIGTERM, self._sighandler)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Start all subsystems and enter the main processing loop."""
-        log.info("=" * 60)
-        log.info("NoIR Biomedical Optical Sensing System  —  STARTING")
-        log.info("IR wavelength: %d nm  |  Resolution: %dx%d  |  FPS target: %d",
-                 self._opt_cfg.ir_wavelength_nm,
-                 self._cam_cfg.width, self._cam_cfg.height,
-                 self._cam_cfg.target_fps)
-        log.info("DISCLAIMER: Experimental optical sensing only.  Non-clinical.")
-        log.info("=" * 60)
-
-        self._acquisition.start()
-        self._visualiser.init()
+        self._print_banner()
+        self._camera.start()
+        self._vis.init()
         self._running = True
 
-        last_metrics = FrameMetrics()
+        log.info("Entering main processing loop.")
 
         try:
             while self._running:
-                frame = self._acquisition.get_frame(timeout=0.5)
+                frame = self._camera.get_frame(timeout=0.5)
                 if frame is None:
                     continue
 
-                self._frame_index += 1
+                self._frame_idx += 1
+                ts = time.monotonic()
 
-                # Full image processing pipeline
-                gray_raw, gray_disp, metrics = self._processor.process(frame)
-                metrics.frame_index = self._frame_index
-                metrics.fps = self._acquisition.fps
+                # ── Image processing ─────────────────────────────────────────
+                gray_metric, gray_disp = self._processor.process(frame)
 
-                # Update optical signal tracker
-                self._tracker.update(metrics)
+                # ── Tissue segmentation ──────────────────────────────────────
+                mask, roi = self._segmenter.segment(gray_metric)
 
-                # Update terminal dashboard at reduced rate (CPU saving)
+                # ── Photometrics ─────────────────────────────────────────────
+                roi_crop = gray_metric[roi.y1:roi.y2, roi.x1:roi.x2].astype(np.float32)
+                roi_mean = float(np.mean(roi_crop)) if roi_crop.size > 0 else 0.0
+                roi_std  = float(np.std(roi_crop))  if roi_crop.size > 0 else 0.0
+
+                flat = gray_metric.ravel().astype(np.float32)
+                mean_int = float(np.mean(flat))
+                sat_frac = float(np.mean(flat >= 254))
+
+                # ── Adaptive exposure update ──────────────────────────────────
+                exp_us, gain = self._exp_ctrl.update(roi_mean)
+
+                # ── Motion detection ──────────────────────────────────────────
+                mad, lap_var, mot_score, is_corrupt = self._motion.update(gray_metric)
+
+                # ── Optical signal push ───────────────────────────────────────
+                finger_present = roi_mean >= 35.0
+                self._signal.push(roi_mean, ts, accept=(not is_corrupt and finger_present))
+
+                # ── Illumination scheduler ────────────────────────────────────
+                illum_mode = self._scheduler.tick()
+
+                # ── Assemble FrameData ────────────────────────────────────────
+                raw_l, filt_l, ac_rms, snr = self._signal.metrics()
+                pulse_conf = float(np.clip((snr - 10.0) / 20.0, 0.0, 1.0))
+
+                fd = FrameData(
+                    ts=ts, frame_idx=self._frame_idx,
+                    fps=self._camera.fps,
+                    illum_mode=illum_mode,
+                    mean_intensity=mean_int,
+                    std_intensity=float(np.std(flat)),
+                    saturation_frac=sat_frac,
+                    laplacian_var=lap_var,
+                    motion_mad=mad,
+                    motion_score=mot_score,
+                    is_motion_corrupt=is_corrupt,
+                    current_exposure_us=exp_us,
+                    current_gain=gain,
+                    roi=roi,
+                    finger_present=finger_present,
+                    roi_mean=roi_mean,
+                    roi_std=roi_std,
+                    raw_signal_latest=raw_l,
+                    filtered_signal_latest=filt_l,
+                    signal_ac_rms=ac_rms,
+                    signal_snr_db=snr,
+                    pulsatility_confidence=pulse_conf,
+                )
+
+                # ── Quality scoring ───────────────────────────────────────────
+                stab, iq, conf, qc = self._quality.evaluate(fd)
+                fd.optical_stability    = stab
+                fd.image_quality        = iq
+                fd.optical_confidence   = conf
+                fd.quality_class        = qc
+
+                # ── Terminal dashboard (throttled) ────────────────────────────
                 now = time.monotonic()
-                if now - self._last_dashboard_t >= self._dashboard_interval:
-                    self._dashboard.render(metrics, self._tracker,
-                                           self._interpreter,
-                                           PICAMERA2_AVAILABLE)
-                    self._last_dashboard_t = now
+                if now - self._last_dash_t >= self._dash_interval:
+                    self._dashboard.render(fd, self._signal, self._interp,
+                                           PICAM_OK, GPIO_OK)
+                    self._last_dash_t = now
 
-                # Visualisation (every frame)
-                if CV2_AVAILABLE:
-                    keep_open = self._visualiser.render(gray_disp, metrics)
-                    if not keep_open:
-                        log.info("User requested exit from visualisation window.")
+                # ── OpenCV visualisation ──────────────────────────────────────
+                if CV2_OK:
+                    keep = self._vis.render(gray_disp, mask, fd, self._signal)
+                    if not keep:
+                        log.info("User closed visualisation window.")
                         self._running = False
-
-                last_metrics = metrics
 
         finally:
             self._shutdown()
 
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+
     def _shutdown(self) -> None:
-        log.info("Shutting down NoIR Optical Sensing System …")
+        log.info("Shutting down NoIR Optical Sensing System v2 …")
         self._running = False
-        self._acquisition.stop()
-        self._visualiser.close()
-        log.info("Session ended.  Total frames processed: %d", self._frame_index)
+        self._camera.stop()
+        self._led.cleanup()
+        self._vis.close()
+        log.info("Session ended.  Frames processed: %d", self._frame_idx)
 
-    def _handle_sigint(self, sig, frame) -> None:
-        log.info("Interrupt received — initiating graceful shutdown.")
+    def _sighandler(self, sig, frame) -> None:
+        log.info("Signal %s received — graceful shutdown.", sig)
         self._running = False
 
+    # ── Banner ────────────────────────────────────────────────────────────────
 
-# ===========================================================================
-# § 10  ENTRY POINT
-# ===========================================================================
-
-def print_startup_banner() -> None:
-    """Print a professional startup banner to stdout."""
-    banner = r"""
-  ╔══════════════════════════════════════════════════════════════════╗
-  ║         NoIR BIOMEDICAL OPTICAL SENSING SYSTEM                  ║
-  ║         Raspberry Pi NoIR Camera — 850 nm IR Reflectance        ║
-  ║         Research Prototype  ·  NON-CLINICAL USE ONLY            ║
-  ╠══════════════════════════════════════════════════════════════════╣
-  ║  Illumination : 850 nm IR LEDs                                  ║
-  ║  Modality     : Diffuse reflectance optical sensing             ║
-  ║  Target tissue: Fingertip (surface + shallow subsurface)        ║
-  ║  Penetration  : ~1–3 mm (physically realistic NIR)              ║
-  ║  Output       : Optical signal + image quality metrics          ║
-  ╠══════════════════════════════════════════════════════════════════╣
-  ║  SCIENTIFIC LIMITATIONS                                         ║
-  ║  • NOT deep-tissue imaging   • NOT clinical diagnosis           ║
-  ║  • NOT X-ray or MRI          • Surface optical reflection ONLY  ║
-  ╚══════════════════════════════════════════════════════════════════╝
-"""
-    print(banner)
+    @staticmethod
+    def _print_banner() -> None:
+        print(r"""
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║   NoIR BIOMEDICAL OPTICAL SENSING SYSTEM  —  v2                     ║
+  ║   Raspberry Pi NoIR Camera | 850 nm IR Reflectance Imaging          ║
+  ║   Research Prototype  ·  NON-CLINICAL USE ONLY                      ║
+  ╠══════════════════════════════════════════════════════════════════════╣
+  ║  Illumination  : 850 nm IR LEDs + White LEDs (GPIO-controlled)      ║
+  ║  Modality      : Diffuse reflectance optical sensing                 ║
+  ║  Target tissue : Fingertip  (surface + shallow subsurface ~1-3 mm)  ║
+  ║  Signal filter : Butterworth bandpass 0.7–4 Hz (scipy)              ║
+  ║  Segmentation  : Adaptive Otsu + ellipse fitting                    ║
+  ║  Exposure ctrl : PI feedback controller (AEC)                       ║
+  ╠══════════════════════════════════════════════════════════════════════╣
+  ║  SCIENTIFIC LIMITATIONS                                              ║
+  ║  • NOT deep-tissue  • NOT clinical  • NOT MRI/X-ray                 ║
+  ║  • Surface/subsurface optical REFLECTION ONLY                        ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+""")
 
 
-def check_dependencies() -> bool:
-    """Verify required libraries and emit warnings for missing ones."""
-    ok = True
-    if not CV2_AVAILABLE:
-        log.warning("OpenCV not available — install with:  pip install opencv-python-headless")
-        ok = False
-    if not PICAMERA2_AVAILABLE:
-        log.warning(
-            "Picamera2 not available — running in SIMULATION mode.  "
-            "Install on Raspberry Pi with:  sudo apt install python3-picamera2"
-        )
-    return ok
+# =============================================================================
+# §17  DEPENDENCY CHECK & ENTRY POINT
+# =============================================================================
+
+def check_deps() -> None:
+    missing = []
+    if not CV2_OK:      missing.append("opencv-python-headless (pip install opencv-python-headless)")
+    if not SCIPY_OK:    missing.append("scipy                  (pip install scipy)")
+    if not PICAM_OK:    log.warning("picamera2 not found — simulation mode active.")
+    if not GPIO_OK:     log.warning("RPi.GPIO not found  — LED control disabled.")
+    for m in missing:
+        log.warning("Missing dependency: %s", m)
 
 
 if __name__ == "__main__":
-    print_startup_banner()
-    check_dependencies()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="NoIR Biomedical Optical Sensing System v2")
+    parser.add_argument(
+        "--auto-illum", action="store_true",
+        help="Cycle illumination modes automatically (IR → White → Hybrid)")
+    args = parser.parse_args()
 
-    system = NoIRBioSensorSystem()
+    check_deps()
+    system = NoIRBioSensorSystemV2(illum_auto=args.auto_illum)
     system.run()
