@@ -1,0 +1,6 @@
+\venv
+\.sixth
+\__pycache__
+*.pyc
+*.pyo
+*.pyd
