@@ -1008,7 +1008,7 @@ _frame_count = 0
 
 def print_frame(frame: VitalFrame) -> None:
     """
-    Render one analysis frame to the terminal.
+    Render one analysis frame to the terminal
 
     Layout:
       ┌──────────────────────────────────────────────────────────────────────┐
