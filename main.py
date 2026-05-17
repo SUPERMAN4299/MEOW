@@ -104,6 +104,34 @@ except ImportError:
     MAX30102Config = None
     MAX30102Driver = None
 
+# MPU-6050 IMU subsystem (integrated from mpu6050_subsystem.py)
+try:
+    from mpu6050_subsystem import (
+        worker_acq_imu as _worker_acq_imu_real,
+        MPU6050Config,
+        MPU6050Driver,
+    )
+    _MPU6050_AVAILABLE = True
+except ImportError:
+    _MPU6050_AVAILABLE = False
+    _worker_acq_imu_real = None
+    MPU6050Config = None
+    MPU6050Driver = None
+
+# NoIR Camera subsystem (integrated from noir_camera_subsystem.py)
+try:
+    from noir_camera_subsystem import (
+        worker_acq_camera as _worker_acq_camera_real,
+        NoIRCameraConfig,
+        CameraHardwareDriver,
+    )
+    _NOIR_CAMERA_AVAILABLE = True
+except ImportError:
+    _NOIR_CAMERA_AVAILABLE = False
+    _worker_acq_camera_real = None
+    NoIRCameraConfig = None
+    CameraHardwareDriver = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # §2  CONFIGURATION DATACLASSES
@@ -644,7 +672,7 @@ class LoggingManager:
 
     _CSV_FIELDS = [
         "ts_rel", "state", "bpm", "spo2", "pi", "ppg_sqi",
-        "roi_mean_ir", "optical_snr_db", "optical_quality_conf",
+        "roi_mean_ir", "roi_std_ir", "optical_snr_db", "optical_quality_conf",
         "accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z",
         "pitch_deg", "roll_deg", "tilt_deg",
         "motion_state", "artifact_score", "ppg_validity_pct",
@@ -722,6 +750,7 @@ class LoggingManager:
             "pi"                 : snap.perfusion_index,
             "ppg_sqi"            : f"{snap.ppg_sqi:.1f}",
             "roi_mean_ir"        : f"{snap.roi_mean_ir:.2f}",
+            "roi_std_ir"         : f"{snap.roi_std_ir:.2f}",
             "optical_snr_db"     : f"{snap.optical_snr_db:.2f}",
             "optical_quality_conf": f"{snap.optical_quality_conf:.3f}",
             "accel_x"            : f"{snap.accel_x:.5f}",
@@ -1290,6 +1319,33 @@ class StateMachineHandlers:
                 cam.close()
                 hw_ok["camera"] = True
                 self._log.info("  Camera: Picamera2 detected OK.")
+                
+                # Optional: Enhanced verification with NoIR camera driver
+                if _NOIR_CAMERA_AVAILABLE and CameraHardwareDriver is not None:
+                    try:
+                        from noir_camera_subsystem import CameraHealthRecord
+                        health = CameraHealthRecord()
+                        cam_cfg = self._cfg.camera
+                        
+                        # Verify driver can open device
+                        if NoIRCameraConfig is not None:
+                            cfg_noir = NoIRCameraConfig(
+                                width           = cam_cfg.width,
+                                height          = cam_cfg.height,
+                                target_fps      = cam_cfg.target_fps,
+                                pixel_format    = cam_cfg.pixel_format,
+                                aec_exp_init_us = cam_cfg.init_exposure_us,
+                                aec_gain_init   = cam_cfg.init_gain,
+                            )
+                            driver = CameraHardwareDriver(cfg_noir, health, self._log)
+                            driver.open()
+                            
+                            # Quick frame capture to verify DMA access
+                            _ = driver.capture()
+                            driver.close()
+                            self._log.info("  Camera: Full NoIR subsystem self-test passed.")
+                    except Exception as e:
+                        self._log.warning("  Camera: Enhanced test failed: %s (basic detection OK)", e)
             except Exception as e:
                 self._log.warning("  Camera: detection failed (%s) — disabling.", e)
         else:
@@ -1339,7 +1395,7 @@ class StateMachineHandlers:
         else:
             self._log.warning("  PPG: disabled or smbus2 unavailable.")
 
-        # ── IMU / MPU-6050 ─────────────────────────────────────────────────
+        # ── IMU / MPU-6050 (enhanced with MPU6050Config support) ──────────
         if self._cfg.hw_imu_enabled and _SMBUS:
             try:
                 bus  = smbus2.SMBus(self._cfg.imu.i2c_bus)
@@ -1348,6 +1404,40 @@ class StateMachineHandlers:
                 if wai == 0x68:
                     hw_ok["imu"] = True
                     self._log.info("  IMU/MPU-6050: WHO_AM_I 0x68 OK.")
+                    
+                    # Optional: Enhanced verification with MPU6050-specific driver
+                    if _MPU6050_AVAILABLE and MPU6050Driver is not None:
+                        try:
+                            from mpu6050_subsystem import IMUHealthRecord
+                            health = IMUHealthRecord()
+                            imu_cfg = self._cfg.imu
+                            
+                            # Verify driver can open device
+                            if MPU6050Config is not None:
+                                cfg_mpu = MPU6050Config(
+                                    i2c_bus      = imu_cfg.i2c_bus,
+                                    sensor_addr  = imu_cfg.sensor_addr,
+                                    sample_rate_hz = imu_cfg.sample_rate_hz,
+                                    accel_fs_sel = 0,   # ±2g
+                                    gyro_fs_sel  = 0,   # ±250°/s
+                                    selftest_enabled = True,
+                                )
+                                driver = MPU6050Driver(cfg_mpu, health, self._log)
+                                driver.open()
+                                
+                                # Quick burst read to verify I²C comms
+                                _ = driver.read_burst()
+                                driver.close()
+                                
+                                # Check self-test result
+                                if health.selftest_passed:
+                                    self._log.info("  IMU/MPU-6050: Full subsystem self-test PASSED.")
+                                else:
+                                    self._log.warning("  IMU/MPU-6050: Self-test inconclusive (%s), "
+                                                    "continuing with caution.",
+                                                    health.selftest_error)
+                        except Exception as e:
+                            self._log.warning("  IMU/MPU-6050: Enhanced test failed: %s (basic detection OK)", e)
                 else:
                     self._log.warning("  IMU/MPU-6050: unexpected WHO_AM_I 0x%02X.", wai)
             except Exception as e:
@@ -1563,15 +1653,44 @@ class StateMachineHandlers:
 
 def _worker_acq_camera(stop_event, state_hub, watchdog, cfg, log):
     """
-    Camera acquisition worker — Picamera2 CSI pipeline.
+    NoIR Camera acquisition worker (integrated from noir_camera_subsystem.py).
 
-    Captures frames at target_fps, applies adaptive exposure control (PI
-    feedback on ROI mean intensity), and enqueues BGR arrays into
-    state_hub.camera_queue. Evicts oldest frame on overflow to prevent
-    back-pressure on the camera driver.
+    Delegates to the complete NoIR camera acquisition + rPPG pipeline if available.
+    Falls back to basic simulation if noir_camera_subsystem cannot be imported.
 
-    Heartbeat: every frame (30 Hz).
+    Features:
+      · 30 Hz frame acquisition from Picamera2 with zero-copy DMA buffer access
+      · IR channel extraction (weighted BGR blend optimised for 850 nm)
+      · Adaptive tissue segmentation with ellipse fitting
+      · Motion quality gating (MAD + Laplacian variance)
+      · Adaptive exposure control (PI feedback on ROI mean intensity)
+      · Optical signal buffering and spectral analysis (Welch)
+      · iPPG BPM proxy and perfusion index estimation (EXPERIMENTAL)
+      · Quality scoring (multi-component confidence [0,1])
+      · OpenCV overlay rendering (15 Hz update)
+      · Health telemetry (I²C errors, frame timeouts, detector quality)
+      · Bounded-memory operation (< 6 MB frame workspace)
+      · Graceful recovery from frame timeouts and Picamera2 exceptions
+
+    Heartbeat: every 10 frames (3 Hz at 30 Hz acquisition).
+    Publishes optical quality, motion state, iPPG metrics, and finger contact
+    into SharedStateHub for downstream fusion with PPG/IMU.
     """
+    # Use real implementation if available, otherwise fall back to basic stub
+    if _NOIR_CAMERA_AVAILABLE and _worker_acq_camera_real is not None:
+        try:
+            _worker_acq_camera_real(
+                stop_event=stop_event,
+                state_hub=state_hub,
+                watchdog=watchdog,
+                cfg=cfg,
+                log=log,
+            )
+            return
+        except Exception as e:
+            log.error("NoIR camera real worker failed: %s — falling back to stub.", e)
+
+    # Fallback: basic simulation (stub from original implementation)
     log.info("acq-camera: starting (hw=%s).", _PICAM)
     cam      = None
     fps_ema  = 0.0
@@ -1816,14 +1935,41 @@ def _worker_acq_ppg(stop_event, state_hub, watchdog, cfg, log):
 
 def _worker_acq_imu(stop_event, state_hub, watchdog, cfg, log):
     """
-    MPU-6050 IMU acquisition worker.
+    MPU-6050 IMU acquisition worker (integrated from mpu6050_subsystem.py).
 
-    14-byte burst reads at 100 Hz, decoded to physical units with
-    calibration offsets applied. Uses hybrid sleep + busy-poll for
-    sub-millisecond timing jitter on Pi 4/5.
+    Delegates to the complete MPU-6050 acquisition + DSP pipeline if available.
+    Falls back to basic simulation if mpu6050_subsystem cannot be imported.
 
-    Heartbeat: every 10 samples (10 Hz).
+    Features:
+      · Full DSP pipeline (gravity separation, BP filtering, normalization)
+      · Calibration engine (gyro bias, accel offset, temperature compensation)
+      · Tremor analysis (FFT-based frequency detection, clinical band classification)
+      · Motion classification (severity scoring, hysteresis state machine)
+      · Multi-criteria artifact scoring (for PPG fusion gating)
+      · Health telemetry (I²C errors, data range errors, temperature monitoring)
+      · Precise timing with hybrid sleep + busy-poll
+      · Graceful fault recovery with watchdog integration
+      · Sensor fusion output (orientation + motion validity for camera/optical)
+
+    Heartbeat: every 10 samples (10 Hz at 100 Hz acquisition).
+    Publishes motion severity, artifact score, tremor frequency, and orientation
+    into SharedStateHub for downstream fusion consumers.
     """
+    # Use real implementation if available, otherwise fall back to basic stub
+    if _MPU6050_AVAILABLE and _worker_acq_imu_real is not None:
+        try:
+            _worker_acq_imu_real(
+                stop_event=stop_event,
+                state_hub=state_hub,
+                watchdog=watchdog,
+                cfg=cfg,
+                log=log,
+            )
+            return
+        except Exception as e:
+            log.error("MPU6050 real worker failed: %s — falling back to stub.", e)
+
+    # Fallback: basic simulation (stub from original implementation)
     log.info("acq-imu: starting (hw=%s).", _SMBUS and cfg.hw_imu_enabled)
     bus  = None
     addr = cfg.imu.sensor_addr
