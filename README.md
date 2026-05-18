@@ -681,21 +681,10 @@ kill -9 <PID>
 streamlit run biosense_dashboard/dashboard/app.py
 ```
 
----
-
-
----
-
-## License
-
-[Specify your license here, e.g., MIT, GPL-3.0, Apache-2.0]
-
----
-
 ## Contact & Support
 
 **Author:** BioSense-Pi Research Team  
-**Repository:** [GitHub URL]  
-**Issues:** [GitHub Issues] or Email  
+**Repository:** https://github.com/SUPERMAN4299/MEOW
+**Issues:** abhinav429912345@gmail.com OR Gitub issues
 
 For scientific collaboration or questions, contact the development team.
