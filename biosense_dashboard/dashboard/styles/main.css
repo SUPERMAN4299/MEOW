@@ -1,0 +1,129 @@
+/* ============================================================
+   BioSense-Pi Dashboard — Global Stylesheet
+   Dark biomedical monitoring theme
+   ============================================================ */
+
+/* ── Base resets ─────────────────────────────────────────── */
+html, body, [class*="css"] {
+    font-family: 'Inter', 'Segoe UI', -apple-system, sans-serif;
+    background-color: #0a0e14 !important;
+    color: #b0bec5 !important;
+}
+
+/* ── Streamlit main container ────────────────────────────── */
+.main .block-container {
+    padding-top: 0.8rem;
+    padding-bottom: 2rem;
+    max-width: 1400px;
+}
+
+/* ── Remove Streamlit default top padding ────────────────── */
+.stApp {
+    background-color: #0a0e14;
+}
+
+/* ── Metric widget cards ─────────────────────────────────── */
+div[data-testid="metric-container"] {
+    background: #0d1117 !important;
+    border: 1px solid #21262d !important;
+    border-radius: 8px !important;
+    padding: 10px 14px !important;
+}
+
+div[data-testid="metric-container"] label {
+    color: #546e7a !important;
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.5px !important;
+    text-transform: uppercase !important;
+}
+
+div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
+    color: #00e5ff !important;
+    font-size: 1.3rem !important;
+    font-weight: 800 !important;
+    font-variant-numeric: tabular-nums !important;
+}
+
+/* ── Streamlit columns ───────────────────────────────────── */
+.stColumns > div {
+    gap: 0.75rem;
+}
+
+/* ── Plotly chart background ─────────────────────────────── */
+.js-plotly-plot .plotly {
+    background: transparent !important;
+}
+
+/* ── Info / warning / success boxes ─────────────────────── */
+div[data-testid="stAlert"] {
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+}
+
+/* ── Streamlit image caption ─────────────────────────────── */
+.stCaption, [data-testid="caption"] {
+    color: #546e7a !important;
+    font-size: 0.72rem !important;
+}
+
+/* ── Scrollbar styling ───────────────────────────────────── */
+::-webkit-scrollbar         { width: 6px; height: 6px; }
+::-webkit-scrollbar-track   { background: #0d1117; }
+::-webkit-scrollbar-thumb   { background: #21262d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #30363d; }
+
+/* ── Sidebar (collapsed by default) ─────────────────────── */
+[data-testid="stSidebar"] {
+    background: #0d1117 !important;
+    border-right: 1px solid #21262d !important;
+}
+
+/* ── Tabs ────────────────────────────────────────────────── */
+.stTabs [data-baseweb="tab-list"] {
+    background: #0d1117 !important;
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    color: #546e7a !important;
+    font-size: 0.82rem !important;
+    padding: 6px 16px !important;
+    border-radius: 6px 6px 0 0 !important;
+}
+.stTabs [aria-selected="true"] {
+    color: #00e5ff !important;
+    background: #161b22 !important;
+    border-bottom: 2px solid #00e5ff !important;
+}
+
+/* ── Expander ────────────────────────────────────────────── */
+.streamlit-expanderHeader {
+    background: #0d1117 !important;
+    border-radius: 8px !important;
+    font-size: 0.82rem !important;
+    color: #80cbc4 !important;
+}
+
+/* ── Headings ────────────────────────────────────────────── */
+h1, h2, h3 {
+    color: #eceff1 !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.5px !important;
+}
+h3 {
+    font-size: 0.95rem !important;
+    color: #80cbc4 !important;
+}
+
+/* ── HR divider ──────────────────────────────────────────── */
+hr {
+    border-color: #21262d !important;
+    margin: 0.5rem 0 !important;
+}
+
+/* ── Plotly modebar (hide) ───────────────────────────────── */
+.modebar { display: none !important; }
+
+/* ── Streamlit footer hide ───────────────────────────────── */
+footer { visibility: hidden; }
+#MainMenu { visibility: hidden; }
