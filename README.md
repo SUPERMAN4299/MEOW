@@ -683,14 +683,6 @@ streamlit run biosense_dashboard/dashboard/app.py
 
 ---
 
-## Contributing & Future Work
-
-See [`to-do.txt`](./to-do.txt) for planned enhancements:
-- [ ] ONNX-based arrhythmia detection model
-- [ ] PostgreSQL data logging backend
-- [ ] REST API for external integrations
-- [ ] Kalman filtering for sensor fusion
-- [ ] Multi-person support (face detection + per-ROI tracking)
 
 ---
 
